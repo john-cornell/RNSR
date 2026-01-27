@@ -26,6 +26,13 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
 
 # Load .env file if it exists
 try:
@@ -61,7 +68,7 @@ DEFAULT_MODELS = {
         "embed": None,  # Anthropic doesn't have embeddings, fall back to OpenAI/Gemini
     },
     LLMProvider.GEMINI: {
-        "llm": "gemini-2.5-flash",  # Best price-performance, use "gemini-3-flash" for latest
+        "llm": "gemini-2.5-flash",  # Best price-performance. Falls back to preview on overload.
         "embed": "text-embedding-004",
     },
 }
@@ -227,6 +234,26 @@ def _get_gemini_llm(model: str, **kwargs: Any) -> Any:
         from google import genai
         from google.genai import types
         
+        # Define exceptions to retry on
+        # If google.api_core is available (usually is with google SDKs)
+        try:
+            from google.api_core import exceptions as google_exceptions
+            RETRY_EXCEPTIONS = (
+                google_exceptions.ServiceUnavailable,
+                google_exceptions.TooManyRequests,
+                google_exceptions.InternalServerError,
+                google_exceptions.ResourceExhausted,
+                google_exceptions.Aborted,
+                ConnectionError,
+                ConnectionRefusedError,
+                TimeoutError,
+                OSError,  # Covers [Errno 61] and other socket errors
+            )
+        except ImportError:
+            # Fallback: Retry on any Exception that mentions overload/503/429
+            # But simpler to just retry on Exception if we can't import specific ones
+            RETRY_EXCEPTIONS = (Exception,)
+
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise ValueError("GOOGLE_API_KEY environment variable not set")
@@ -238,14 +265,40 @@ def _get_gemini_llm(model: str, **kwargs: Any) -> Any:
             def __init__(self, model_name: str, api_key: str):
                 self.client = genai.Client(api_key=api_key)
                 self.model_name = model_name
+                self.fallback_model = "gemini-3-flash-preview"
             
+            @retry(
+                stop=stop_after_attempt(5),
+                wait=wait_exponential(multiplier=1, min=2, max=30),
+                retry=retry_if_exception_type(RETRY_EXCEPTIONS),
+            )
             def complete(self, prompt: str, **kw: Any) -> str:
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt,
-                )
-                return response.text or ""
+                try:
+                    # Try primary model first
+                    response = self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=prompt,
+                    )
+                    return response.text or ""
+                except RETRY_EXCEPTIONS as e:
+                    # Fallback to preview model on overload/exhaustion
+                    logger.warning(
+                        "primary_llm_overloaded_using_fallback", 
+                        primary=self.model_name, 
+                        fallback=self.fallback_model,
+                        error=str(e)
+                    )
+                    response = self.client.models.generate_content(
+                        model=self.fallback_model,
+                        contents=prompt,
+                    )
+                    return response.text or ""
             
+            @retry(
+                stop=stop_after_attempt(5),
+                wait=wait_exponential(multiplier=1, min=2, max=30),
+                retry=retry_if_exception_type(RETRY_EXCEPTIONS),
+            )
             def chat(self, messages: list, **kw: Any) -> str:
                 # Convert to genai format
                 contents = []
@@ -253,11 +306,26 @@ def _get_gemini_llm(model: str, **kwargs: Any) -> Any:
                     role = "user" if msg.get("role") == "user" else "model"
                     contents.append({"role": role, "parts": [{"text": msg.get("content", "")}]})
                 
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=contents,
-                ) 
-                return response.text or ""
+                try:
+                    # Try primary model first
+                    response = self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=contents,
+                    ) 
+                    return response.text or ""
+                except RETRY_EXCEPTIONS as e:
+                    # Fallback to preview model
+                    logger.warning(
+                        "primary_llm_overloaded_using_fallback", 
+                        primary=self.model_name, 
+                        fallback=self.fallback_model,
+                        error=str(e)
+                    )
+                    response = self.client.models.generate_content(
+                        model=self.fallback_model,
+                        contents=contents,
+                    )
+                    return response.text or ""
         
         return GeminiWrapper(model, api_key)
         
@@ -265,7 +333,73 @@ def _get_gemini_llm(model: str, **kwargs: Any) -> Any:
         # Fall back to llama-index-llms-gemini (deprecated)
         try:
             from llama_index.llms.gemini import Gemini
-            return Gemini(model=model, **kwargs)
+            
+            # Define exceptions for legacy/llama-index path
+            try:
+                from google.api_core import exceptions as google_exceptions
+                RETRY_EXCEPTIONS_LEGACY = (
+                    google_exceptions.ServiceUnavailable,
+                    google_exceptions.TooManyRequests,
+                    google_exceptions.InternalServerError,
+                    google_exceptions.ResourceExhausted,
+                    google_exceptions.Aborted,
+                    google_exceptions.DeadlineExceeded,
+                    ConnectionError,
+                    ConnectionRefusedError,
+                    TimeoutError,
+                    OSError,
+                )
+            except ImportError:
+                RETRY_EXCEPTIONS_LEGACY = (Exception,)
+
+            class LlamaIndexGeminiWrapper:
+                """Wrapper for llama-index Gemini to provide fallback logic."""
+                
+                def __init__(self, model_name: str, **kwargs):
+                    self.model_name = model_name
+                    self.primary = Gemini(model=model_name, **kwargs)
+                    # Fallback to older stable model or preview
+                    self.fallback_model = "models/gemini-1.5-flash"
+                    self.fallback = Gemini(model=self.fallback_model, **kwargs)
+                
+                @retry(
+                    stop=stop_after_attempt(5),
+                    wait=wait_exponential(multiplier=1, min=2, max=30),
+                    retry=retry_if_exception_type(RETRY_EXCEPTIONS_LEGACY),
+                )
+                def complete(self, prompt: str, **kw: Any) -> Any:
+                    try:
+                        return self.primary.complete(prompt, **kw)
+                    except RETRY_EXCEPTIONS_LEGACY as e:
+                        logger.warning(
+                            "primary_llm_overloaded_using_fallback", 
+                            primary=self.model_name, 
+                            fallback=self.fallback_model,
+                            error=str(e)
+                        )
+                        return self.fallback.complete(prompt, **kw)
+
+                @retry(
+                    stop=stop_after_attempt(5),
+                    wait=wait_exponential(multiplier=1, min=2, max=30),
+                    retry=retry_if_exception_type(RETRY_EXCEPTIONS_LEGACY),
+                )
+                def chat(self, messages: Any, **kw: Any) -> Any:
+                    try:
+                        return self.primary.chat(messages, **kw)
+                    except RETRY_EXCEPTIONS_LEGACY as e:
+                        logger.warning(
+                            "primary_llm_overloaded_using_fallback", 
+                            primary=self.model_name, 
+                            fallback=self.fallback_model,
+                            error=str(e)
+                        )
+                        return self.fallback.chat(messages, **kw)
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self.primary, name)
+
+            return LlamaIndexGeminiWrapper(model, **kwargs)
         except ImportError:
             raise ImportError(
                 "Neither google-genai nor llama-index-llms-gemini installed. "

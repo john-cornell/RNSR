@@ -532,6 +532,33 @@ class BenchmarkLoader:
                 metrics=["accuracy", "answer_em"],
                 source_url="https://github.com/nyu-mll/quality",
             )
+
+    @staticmethod
+    def load_financebench(
+        split: str = "train",
+        max_samples: int | None = None,
+    ) -> BenchmarkDataset:
+        """
+        Load FinanceBench dataset.
+        
+        FinanceBench features:
+        - Financial QA over complex PDFs
+        - Requires table/chart understanding
+        - Document-level retrieval
+        """
+        try:
+            from rnsr.benchmarks.finance_bench import FinanceBenchLoader
+            return FinanceBenchLoader.load(split=split, max_samples=max_samples)
+        except Exception as e:
+            logger.error("Failed to load FinanceBench", error=str(e))
+            return BenchmarkDataset(
+                name="FinanceBench",
+                description="Financial QA (Failed to load)",
+                questions=[],
+                metrics=[],
+                source_url=""
+            )
+
     
     @staticmethod
     def load_narrative_qa(

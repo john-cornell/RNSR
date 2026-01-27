@@ -70,6 +70,12 @@ dmypy.json
 benchmark_results/
 *.db
 
+# Huggingface cache (large model files)
+.cache/
+
 # Documentation
 docs/_build/
 site/
+
+# Test PDFs
+test_pdfs/

@@ -91,9 +91,7 @@ class DocumentTree(BaseModel):
     root: DocumentNode
     total_nodes: int = 0
     ingestion_tier: Literal[1, 2, 3] = 1
-    ingestion_method: Literal["font_histogram", "semantic_splitter", "ocr"] = (
-        "font_histogram"
-    )
+    ingestion_method: IngestionMethod | None = None
 
 
 # =============================================================================
@@ -119,7 +117,7 @@ class IngestionResult(BaseModel):
 
     tree: DocumentTree
     tier_used: Literal[1, 2, 3]
-    method: Literal["font_histogram", "semantic_splitter", "ocr"]
+    method: IngestionMethod
     warnings: list[str] = Field(default_factory=list)
     stats: dict[str, Any] = Field(default_factory=dict)
 
@@ -158,3 +156,12 @@ class RetrievalTrace(BaseModel):
     variables_stored: list[str]
     final_path: str
     entries: list[TraceEntry] = Field(default_factory=list)
+
+# Define the type alias for all valid ingestion methods
+IngestionMethod = Literal[
+    "font_histogram",
+    "semantic_splitter", 
+    "ocr",
+    "xy_cut",
+    "hierarchical_clustering",
+]

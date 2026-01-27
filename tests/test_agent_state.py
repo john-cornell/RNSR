@@ -123,6 +123,12 @@ class TestAgentStateTyping:
             "current_node_id",
             "visited_nodes",
             "navigation_path",
+            # Tree of Thoughts (ToT) fields
+            "scored_candidates",
+            "backtrack_stack",
+            "dead_ends",
+            "top_k",
+            # Variable stitching
             "variables",
             "context",
             "answer",
@@ -134,3 +140,18 @@ class TestAgentStateTyping:
         
         for field in required_fields:
             assert field in state, f"Missing field: {field}"
+    
+    def test_tot_fields_initialized(self):
+        """Test that Tree of Thoughts fields are properly initialized."""
+        state = create_initial_state("Test question", "root")
+        
+        assert state["scored_candidates"] == []
+        assert state["backtrack_stack"] == []
+        assert state["dead_ends"] == []
+        assert state["top_k"] == 3  # Default value
+    
+    def test_custom_top_k(self):
+        """Test custom top_k for ToT selection."""
+        state = create_initial_state("Test question", "root", top_k=5)
+        
+        assert state["top_k"] == 5

@@ -176,10 +176,10 @@ def _get_embedding_model(provider: str | None = None):
 
 def _build_tree_from_semantic_nodes(nodes: list, title: str) -> DocumentTree:
     """
-    Build a flat tree structure from semantic splitter nodes.
+    Build a two-level tree structure from semantic splitter nodes.
     
-    Since semantic splitting doesn't provide hierarchy, we create
-    a flat structure with synthetic section headers.
+    This creates a hierarchy for plain text to give the navigator agent
+    a more meaningful structure to traverse.
     """
     root = DocumentNode(
         id="root",
@@ -187,23 +187,73 @@ def _build_tree_from_semantic_nodes(nodes: list, title: str) -> DocumentTree:
         header=title,
     )
     
-    for i, node in enumerate(nodes, 1):
-        # Generate synthetic header from first few words
-        text = node.text.strip()
-        synthetic_header = _generate_synthetic_header(text, i)
-        
-        section = DocumentNode(
-            id=f"sec_{i:03d}",
-            level=1,  # All at same level (flat)
-            header=synthetic_header,
-            content=text,
-        )
-        root.children.append(section)
+    logger.info("generating_synthetic_headers", count=len(nodes))
     
+    # Helper to generate header (wrapped for potential parallelization later)
+    # For now, we add logging so the user knows it's not frozen
+    def get_header(text, index):
+        h = _generate_synthetic_header(text)
+        if h: 
+            return h
+        return f"Section {index}"
+
+    # For plain text, create a two-level hierarchy.
+    group_size = 5  # Segments per group
+    if len(nodes) < group_size * 1.5:  # Don't group if it results in tiny groups
+        # Create a flat tree if not enough segments for meaningful grouping
+        for i, node in enumerate(nodes, 1):
+            if i % 5 == 0:
+                logger.info("processing_node", current=i, total=len(nodes))
+                
+            text = node.text.strip()
+            synthetic_header = get_header(text, i)
+            section = DocumentNode(
+                id=f"sec_{i:03d}",
+                level=1,
+                header=synthetic_header,
+                content=text,
+            )
+            root.children.append(section)
+    else:
+        # Create parent nodes to add hierarchy
+        num_groups = (len(nodes) + group_size - 1) // group_size
+        logger.info("processing_groups", total_groups=num_groups)
+        
+        for i in range(num_groups):
+            logger.info("processing_group", current=i+1, total=num_groups)
+            
+            start_index = i * group_size
+            end_index = start_index + group_size
+            group_nodes = nodes[start_index:end_index]
+
+            # Use the header of the first node in the group for the parent
+            parent_header_text = group_nodes[0].text.strip()
+            parent_header = get_header(parent_header_text, i + 1)
+
+            parent_node = DocumentNode(
+                id=f"group_{i}",
+                level=1,
+                header=parent_header,
+            )
+
+            for j, node in enumerate(group_nodes):
+                text = node.text.strip()
+                child_header = f"Paragraph {j + 1}"
+                
+                child_node = DocumentNode(
+                    id=f"sec_{(start_index + j):03d}",
+                    level=2,
+                    header=child_header,
+                    content=text,
+                )
+                parent_node.children.append(child_node)
+            
+            root.children.append(parent_node)
+
     return DocumentTree(
         title=title,
         root=root,
-        total_nodes=len(nodes) + 1,
+        total_nodes=len(nodes) + 1, # This is an approximation
         ingestion_tier=2,
         ingestion_method="semantic_splitter",
     )
@@ -229,8 +279,15 @@ def _simple_chunk_fallback(text: str, title: str, chunk_size: int = 1000) -> Doc
     # Group paragraphs into chunks
     current_chunk = ""
     chunk_num = 0
+
+    # Helper to generate header safely
+    def get_header(text, index):
+        h = _generate_synthetic_header(text)
+        if h: 
+            return h
+        return f"Section {index}"
     
-    for para in paragraphs:
+    for i, para in enumerate(paragraphs):
         para = para.strip()
         if not para:
             continue
@@ -238,10 +295,13 @@ def _simple_chunk_fallback(text: str, title: str, chunk_size: int = 1000) -> Doc
         if len(current_chunk) + len(para) > chunk_size:
             if current_chunk:
                 chunk_num += 1
+                if chunk_num % 5 == 0:
+                    logger.info("processing_chunk", current=chunk_num)
+                    
                 section = DocumentNode(
                     id=f"sec_{chunk_num:03d}",
                     level=1,
-                    header=_generate_synthetic_header(current_chunk, chunk_num),
+                    header=get_header(current_chunk, chunk_num),
                     content=current_chunk,
                 )
                 root.children.append(section)
@@ -255,7 +315,7 @@ def _simple_chunk_fallback(text: str, title: str, chunk_size: int = 1000) -> Doc
         section = DocumentNode(
             id=f"sec_{chunk_num:03d}",
             level=1,
-            header=_generate_synthetic_header(current_chunk, chunk_num),
+            header=get_header(current_chunk, chunk_num),
             content=current_chunk,
         )
         root.children.append(section)
@@ -271,9 +331,70 @@ def _simple_chunk_fallback(text: str, title: str, chunk_size: int = 1000) -> Doc
 
 def _generate_synthetic_header(text: str, section_num: int) -> str:
     """
-    Generate a synthetic header from text content.
+    Generate a synthetic header from text content using LLM.
     
-    Takes the first few meaningful words from the text.
+    Per the research paper (Section 6.3): "For each identified section, 
+    we execute an LLM call with prompt: 'Generate a descriptive, 
+    hierarchical title for it. Return ONLY the title.'"
+    
+    Falls back to heuristic extraction if LLM fails.
+    """
+    # Try LLM-based header generation first
+    try:
+        header = _generate_header_via_llm(text, section_num)
+        if header:
+            return header
+    except Exception as e:
+        logger.debug("llm_header_generation_failed", error=str(e))
+    
+    # Fallback: heuristic extraction
+    return _generate_header_heuristic(text, section_num)
+
+
+def _generate_header_via_llm(text: str, section_num: int) -> str | None:
+    """
+    Use LLM to generate a concise, descriptive header for a text section.
+    
+    This implements the Synthetic Header Generation from Section 4.2.2:
+    "The 'Title' of each node in this semantic tree is generated generatively:
+    we feed the text of the cluster to a summarization LLM with the prompt 
+    'Generate a concise 5-word header for this text section.'"
+    """
+    from rnsr.llm import get_llm
+    
+    # Truncate text to avoid token limits (first 1500 chars should be enough for context)
+    text_sample = text[:1500] if len(text) > 1500 else text
+    
+    prompt = f"""Read the following text segment and generate a descriptive, hierarchical title for it.
+The title should be concise (3-7 words) and capture the main topic of this section.
+
+Text:
+{text_sample}
+
+Return ONLY the title, nothing else. Example format: "Section 3: Liability Limitations" or "Payment Terms and Conditions" """
+
+    try:
+        # Use centralized provider with retry logic
+        llm = get_llm()
+        # Note: LlamaIndex LLM.complete() usually returns a CompletionResponse,
+        # but our custom Gemini wrapper returns a string. str() handles both.
+        response = llm.complete(prompt)
+        header = str(response).strip().strip('"').strip("'")
+        
+        # Validate: should be reasonable length
+        if 3 <= len(header) <= 100:
+            logger.debug("llm_header_generated", header=header[:50])
+            return header
+            
+    except Exception as e:
+        logger.debug("synthetic_header_generation_failed", error=str(e))
+    
+    return None
+
+
+def _generate_header_heuristic(text: str, section_num: int) -> str:
+    """
+    Fallback: Generate header from first sentence/words when LLM unavailable.
     """
     # Get first sentence or first N words
     words = text.split()[:10]

@@ -37,12 +37,12 @@ from rnsr.models import DocumentNode, DocumentTree, SkeletonNode
 logger = structlog.get_logger(__name__)
 
 
-def generate_summary(content: str, max_words: int = 75) -> str:
+def generate_summary(content: str, max_words: int = 100) -> str:
     """
     Generate a summary for a node's content.
     
-    In production, this should use an LLM. For now, we use
-    a simple truncation approach.
+    EXTRACTIVE approach: Take first portion to preserve key facts,
+    entities, and concrete details that ToT needs for evaluation.
     
     Args:
         content: Full text content.
@@ -59,7 +59,11 @@ def generate_summary(content: str, max_words: int = 75) -> str:
     if len(words) <= max_words:
         return content
     
-    # Simple truncation with ellipsis
+    # EXTRACTIVE SUMMARY: Take first max_words to preserve:
+    # - Opening sentences (often contain key context)
+    # - Named entities (people, places, concepts)
+    # - Concrete facts (numbers, dates, specific actions)
+    # This gives ToT better signal than arbitrary truncation
     return " ".join(words[:max_words]) + "..."
 
 
@@ -93,12 +97,22 @@ async def generate_summary_llm(
             return generate_summary(content, max_words)
     
     prompt = f"""Summarize the following text in {max_words} words or less.
-Focus on key concepts, entities, and main points.
+
+IMPORTANT: Use an EXTRACTIVE approach - preserve:
+- Key facts, entities, names, and concrete details (who, what, when, where)
+- Specific actions, events, and outcomes
+- Numbers, dates, and measurements
+- The main subject and what happens to/with it
+
+Avoid:
+- Vague generalizations ("discusses various topics")
+- Meta-commentary ("this section explains...")
+- Abstractions without specifics
 
 TEXT:
 {content}
 
-SUMMARY:"""
+EXTRACTIVE SUMMARY:"""
     
     try:
         response = await llm.acomplete(prompt)

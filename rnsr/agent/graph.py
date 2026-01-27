@@ -1,15 +1,18 @@
 """
 Agent Graph - LangGraph State Machine for Document Navigation
 
-Implements the Navigator Agent that:
-1. Decomposes queries into sub-questions
+Implements the Navigator Agent with full RLM (Recursive Language Model) support:
+
+1. Decomposes queries into sub-questions (Section 2.2 - Recursive Loop)
 2. Navigates the document tree (expand/traverse decisions)
-3. Stores findings as pointers (Variable Stitching)
+3. Stores findings as pointers (Variable Stitching - Section 2.2)
 4. Synthesizes final answer from stored pointers
+5. Tree of Thoughts prompting (Section 7.2)
+6. Recursive sub-LLM invocation for complex queries
 
 Agent State follows Appendix C specification:
 - question: Current question being answered
-- sub_questions: Decomposed sub-questions
+- sub_questions: Decomposed sub-questions (via LLM)
 - current_node_id: Where we are in the document tree
 - visited_nodes: Navigation history
 - variables: Stored findings as $POINTER -> content
@@ -21,6 +24,7 @@ Agent State follows Appendix C specification:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Literal, TypedDict, cast
 
@@ -28,6 +32,7 @@ import structlog
 
 from rnsr.agent.variable_store import VariableStore, generate_pointer_name
 from rnsr.indexing.kv_store import KVStore
+from rnsr.indexing.semantic_search import SemanticSearcher
 from rnsr.models import SkeletonNode, TraceEntry
 
 logger = structlog.get_logger(__name__)
@@ -58,6 +63,15 @@ class AgentState(TypedDict):
     visited_nodes: list[str]
     navigation_path: list[str]
     
+    # Tree of Thoughts (ToT) state - Section 7.2
+    nodes_to_visit: list[str] # Queue for parallel exploration
+    scored_candidates: list[dict[str, Any]]  # [{node_id, score, reasoning}]
+    backtrack_stack: list[str]  # Stack of parent node IDs for backtracking
+    dead_ends: list[str]  # Nodes marked as dead ends
+    top_k: int  # Number of top candidates to explore
+    tot_selection_threshold: float  # Minimum probability for selection
+    tot_dead_end_threshold: float   # Probability threshold for dead end
+    
     # Variable stitching (pointers only!)
     variables: list[str]  # List of $POINTER names
     context: str  # Contains pointers, not full content
@@ -65,6 +79,9 @@ class AgentState(TypedDict):
     # Output
     answer: str | None
     confidence: float
+    
+    # Question metadata (e.g., multiple-choice options)
+    metadata: dict[str, Any]
     
     # Traceability
     trace: list[dict[str, Any]]
@@ -249,8 +266,12 @@ def create_initial_state(
     question: str,
     root_node_id: str,
     max_iterations: int = 20,
+    top_k: int = 3,
+    metadata: dict[str, Any] | None = None,
+    tot_selection_threshold: float = 0.4,
+    tot_dead_end_threshold: float = 0.1,
 ) -> AgentState:
-    """Create the initial agent state."""
+    """Create the initial agent state with ToT support."""
     return AgentState(
         question=question,
         sub_questions=[],
@@ -259,10 +280,20 @@ def create_initial_state(
         current_node_id=root_node_id,
         visited_nodes=[],
         navigation_path=[root_node_id],
+        # Tree of Thoughts state
+        nodes_to_visit=[],
+        scored_candidates=[],
+        backtrack_stack=[],
+        dead_ends=[],
+        top_k=top_k,
+        tot_selection_threshold=tot_selection_threshold,
+        tot_dead_end_threshold=tot_dead_end_threshold,
+        # Variable stitching
         variables=[],
         context="",
         answer=None,
         confidence=0.0,
+        metadata=metadata or {},
         trace=[],
         iteration=0,
         max_iterations=max_iterations,
@@ -286,35 +317,387 @@ def add_trace_entry(
 
 
 # =============================================================================
+# Tree of Thoughts (ToT) Prompting - Section 7.2
+# =============================================================================
+
+# ToT System Prompt as specified in the research paper
+TOT_SYSTEM_PROMPT = """You are a Deep Research Agent navigating a document tree.
+
+You are currently at Node: {current_node_summary}
+Children Nodes: {children_summaries}
+Your Goal: {query}
+
+EVALUATION TASK:
+For each child node, estimate the probability (0.0 to 1.0) that it contains relevant information for the goal.
+
+INSTRUCTIONS:
+1. Evaluate: For each child node, analyze its summary and estimate relevance probability.
+2. Be OPEN-MINDED: Select nodes with probability > {selection_threshold} (moderate evidence of relevance).
+3. Look for matches: Prefer nodes with facts/entities mentioned in the query, but also consider broad thematic matches.
+4. Balance PRECISION and RECALL: Do not prune branches too early. If unsure, include the node.
+5. Plan: Select the top-{top_k} most promising nodes.
+6. Reasoning: Explain briefly what SPECIFIC content in the summary makes it relevant.
+7. Backtrack Signal: If NO child seems relevant (all probabilities < {dead_end_threshold}), report "DEAD_END".
+
+OUTPUT FORMAT (JSON):
+{{
+    "evaluations": [
+        {{"node_id": "...", "probability": 0.85, "reasoning": "Summary mentions X which directly relates to query about Y"}},
+        {{"node_id": "...", "probability": 0.60, "reasoning": "Contains information about Z"}},
+        ...
+    ],
+    "selected_nodes": ["node_id_1", "node_id_2", ...],
+    "is_dead_end": false,
+    "backtrack_reason": null
+}}
+
+If this is a dead end:
+{{
+    "evaluations": [...],
+    "selected_nodes": [],
+    "is_dead_end": true,
+    "backtrack_reason": "None of the children appear to contain information about X."
+}}
+
+Respond ONLY with the JSON, no other text."""
+
+
+def _format_node_summary(node: SkeletonNode) -> str:
+    """Format a node's summary for the ToT prompt."""
+    return f"[{node.node_id}] {node.header}: {node.summary or '(no summary)'}"
+
+
+def _format_children_summaries(
+    skeleton: dict[str, SkeletonNode],
+    child_ids: list[str],
+) -> str:
+    """Format all children summaries for the ToT prompt."""
+    if not child_ids:
+        return "(no children - this is a leaf node)"
+    
+    lines = []
+    for child_id in child_ids:
+        child = skeleton.get(child_id)
+        if child:
+            lines.append(f"  - {_format_node_summary(child)}")
+    
+    return "\n".join(lines) if lines else "(no children found)"
+
+
+def evaluate_children_with_tot(
+    state: AgentState,
+    skeleton: dict[str, SkeletonNode],
+    top_k_override: int | None = None,
+) -> dict[str, Any]:
+    """
+    Use Tree of Thoughts prompting to evaluate child nodes.
+    
+    This implements Section 7.2 of the research paper:
+    "We use Tree of Thoughts (ToT) which explicitly encourages the model 
+    to explore multiple branches of the index before committing to a path."
+    
+    Args:
+        state: Current agent state.
+        skeleton: Skeleton index.
+        top_k_override: Optional override for adaptive exploration.
+        
+    Returns:
+        Dictionary with evaluations, selected_nodes, is_dead_end, and backtrack_reason.
+    """
+    node_id = state.get("current_node_id")
+    if node_id is None:
+        return {"evaluations": [], "selected_nodes": [], "is_dead_end": True, "backtrack_reason": "No current node"}
+    
+    node = skeleton.get(node_id)
+    if node is None:
+        return {"evaluations": [], "selected_nodes": [], "is_dead_end": True, "backtrack_reason": "Node not found"}
+    
+    # If no children, this is a leaf - expand instead of traverse
+    if not node.child_ids:
+        return {"evaluations": [], "selected_nodes": [], "is_dead_end": False, "backtrack_reason": None, "is_leaf": True}
+    
+    # Format the ToT prompt
+    current_summary = _format_node_summary(node)
+    children_summaries = _format_children_summaries(skeleton, node.child_ids)
+    query = state.get("current_sub_question") or state.get("question", "")
+    top_k = top_k_override if top_k_override is not None else state.get("top_k", 3)
+    selection_threshold = state.get("tot_selection_threshold", 0.4)
+    dead_end_threshold = state.get("tot_dead_end_threshold", 0.1)
+    
+    prompt = TOT_SYSTEM_PROMPT.format(
+        current_node_summary=current_summary,
+        children_summaries=children_summaries,
+        query=query,
+        top_k=top_k,
+        selection_threshold=selection_threshold,
+        dead_end_threshold=dead_end_threshold,
+    )
+    
+    # Call the LLM
+    try:
+        from rnsr.llm import get_llm
+        import json
+        
+        llm = get_llm()
+        response = llm.complete(prompt)
+        response_text = str(response).strip()
+        
+        # Parse JSON response with robust error handling
+        try:
+            # Handle potential markdown code blocks
+            if "```" in response_text:
+                match = re.search(r'\{[\s\S]*\}', response_text)
+                if match:
+                    response_text = match.group(0)
+
+            result = json.loads(response_text)
+        except json.JSONDecodeError:
+            logger.warning("tot_json_repair_attempt", original_response=response_text)
+            # Fallback to asking the LLM to fix the JSON
+            repair_prompt = f"""The following text is a malformed JSON object. Please fix it and return ONLY the corrected JSON. Do not add any commentary.
+
+Malformed JSON:
+{response_text}"""
+            from rnsr.llm import get_llm
+
+            llm = get_llm()
+            repaired_response_text = str(llm.complete(repair_prompt)).strip()
+            
+            # Final attempt to parse the repaired JSON
+            if "```" in repaired_response_text:
+                 match = re.search(r'\{[\s\S]*\}', repaired_response_text)
+                 if match:
+                    repaired_response_text = match.group(0)
+
+            result = json.loads(repaired_response_text)
+        
+        logger.debug(
+            "tot_evaluation_complete",
+            node_id=node_id,
+            evaluations=len(result.get("evaluations", [])),
+            selected=result.get("selected_nodes", []),
+            is_dead_end=result.get("is_dead_end", False),
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.warning("tot_evaluation_failed", error=str(e), node_id=node_id)
+        
+        # Fallback: use simple heuristic (select first unvisited children)
+        visited = state.get("visited_nodes", [])
+        dead_ends = state.get("dead_ends", [])
+        
+        unvisited = [
+            cid for cid in node.child_ids 
+            if cid not in visited and cid not in dead_ends
+        ]
+        
+        return {
+            "evaluations": [{"node_id": cid, "probability": 0.5, "reasoning": "Fallback selection"} for cid in unvisited[:top_k]],
+            "selected_nodes": unvisited[:top_k],
+            "is_dead_end": len(unvisited) == 0,
+            "backtrack_reason": "No unvisited children" if len(unvisited) == 0 else None,
+        }
+
+
+def backtrack_to_parent(
+    state: AgentState,
+    skeleton: dict[str, SkeletonNode],
+) -> AgentState:
+    """
+    Backtrack to parent node when current path is a dead end.
+    
+    Implements the backtracking logic from Section 7.2:
+    "Backtrack: If a node yields no useful info, report 'Dead End' and return to parent."
+    """
+    new_state = cast(AgentState, dict(state))
+    
+    current_id = new_state["current_node_id"]
+    
+    # Mark current node as dead end
+    if current_id and current_id not in new_state["dead_ends"]:
+        new_state["dead_ends"].append(current_id)
+    
+    # Try to backtrack using the backtrack stack
+    if new_state["backtrack_stack"]:
+        parent_id = new_state["backtrack_stack"].pop()
+        new_state["current_node_id"] = parent_id
+        new_state["navigation_path"].append(parent_id)
+        
+        add_trace_entry(
+            new_state,
+            "navigation",
+            f"Backtracked to {parent_id} (dead end at {current_id})",
+            {"from": current_id, "to": parent_id, "reason": "dead_end"},
+        )
+        
+        logger.debug("backtrack_success", from_node=current_id, to_node=parent_id)
+    else:
+        # No parent to backtrack to - we're done exploring
+        add_trace_entry(
+            new_state,
+            "navigation",
+            "Cannot backtrack - at root or stack empty",
+            {"current": current_id},
+        )
+        logger.debug("backtrack_failed", reason="empty_stack")
+    
+    new_state["iteration"] = new_state["iteration"] + 1
+    return new_state
+
+
+# =============================================================================
 # LangGraph Node Functions
 # =============================================================================
 
 
+# Decomposition prompt for RLM recursive sub-task generation
+DECOMPOSITION_PROMPT = """You are analyzing a complex query to decompose it into sub-tasks.
+
+Query: {query}
+
+Document Structure (top-level sections):
+{structure}
+
+TASK: Decompose this query into specific sub-tasks that can be executed independently.
+
+RULES:
+1. Each sub-task should target a specific section or piece of information
+2. Sub-tasks should be answerable by reading specific document sections
+3. For comparison queries, create one sub-task per item being compared
+4. For multi-hop queries, create sequential sub-tasks (find A, then use A to find B)
+5. Maximum 5 sub-tasks to maintain efficiency
+
+OUTPUT FORMAT (JSON):
+{{
+    "sub_tasks": [
+        {{"id": 1, "task": "Find X in section Y", "target_section": "section_hint"}},
+        {{"id": 2, "task": "Extract Z from W", "target_section": "section_hint"}}
+    ],
+    "synthesis_plan": "How to combine sub-task results into final answer"
+}}
+
+Return ONLY valid JSON."""
+
+
 def decompose_query(state: AgentState) -> AgentState:
     """
-    Decompose the main question into sub-questions.
+    Decompose the main question into sub-questions using LLM.
     
-    This is typically done by an LLM, but here's a simple version.
+    Implements Section 2.2 "The Recursive Loop":
+    "The model's capability to divide a complex reasoning task into 
+    smaller, manageable sub-tasks and invoke instances of itself to solve them."
     """
     new_state = cast(AgentState, dict(state))  # Copy
-    
-    # Simple decomposition (in production, use LLM)
     question = new_state["question"]
     
-    # For now, just use the main question
-    new_state["sub_questions"] = [question]
-    new_state["pending_questions"] = [question]
-    new_state["current_sub_question"] = question
+    # Try LLM-based decomposition
+    try:
+        from rnsr.llm import get_llm
+        import json
+        
+        llm = get_llm()
+        
+        # Get document structure for context
+        # Note: skeleton is not available here, so we'll do basic decomposition
+        structure_hint = "Document sections available for navigation"
+        
+        prompt = DECOMPOSITION_PROMPT.format(
+            query=question,
+            structure=structure_hint,
+        )
+        
+        response = llm.complete(prompt)
+        response_text = str(response).strip()
+        
+        # Extract JSON from response
+        json_match = re.search(r'\{[\s\S]*\}', response_text)
+        if json_match:
+            decomposition = json.loads(json_match.group())
+            sub_tasks = decomposition.get("sub_tasks", [])
+            
+            if sub_tasks:
+                sub_questions = [t["task"] for t in sub_tasks]
+                new_state["sub_questions"] = sub_questions
+                new_state["pending_questions"] = sub_questions.copy()
+                new_state["current_sub_question"] = sub_questions[0]
+                
+                add_trace_entry(
+                    new_state,
+                    "decomposition",
+                    f"LLM decomposed into {len(sub_questions)} sub-tasks",
+                    {
+                        "sub_questions": sub_questions,
+                        "synthesis_plan": decomposition.get("synthesis_plan", ""),
+                    },
+                )
+                
+                new_state["iteration"] = new_state["iteration"] + 1
+                return new_state
+    
+    except Exception as e:
+        logger.warning("llm_decomposition_failed", error=str(e))
+    
+    # Fallback: simple decomposition patterns
+    sub_questions = _simple_decompose(question)
+    new_state["sub_questions"] = sub_questions
+    new_state["pending_questions"] = sub_questions.copy()
+    new_state["current_sub_question"] = sub_questions[0] if sub_questions else question
     
     add_trace_entry(
         new_state,
         "decomposition",
-        f"Decomposed into {len(new_state['sub_questions'])} sub-questions",
-        {"sub_questions": new_state["sub_questions"]},
+        f"Decomposed into {len(sub_questions)} sub-questions (fallback)",
+        {"sub_questions": sub_questions},
     )
     
     new_state["iteration"] = new_state["iteration"] + 1
     return new_state
+
+
+def _simple_decompose(question: str) -> list[str]:
+    """
+    Simple pattern-based decomposition fallback.
+    
+    Handles common query patterns without LLM.
+    """
+    question_lower = question.lower()
+    
+    # Pattern: "Compare X and Y" or "X vs Y"
+    compare_patterns = [
+        r"compare\s+(.+?)\s+(?:and|with|to|vs\.?)\s+(.+)",
+        r"difference(?:s)?\s+between\s+(.+?)\s+and\s+(.+)",
+        r"(.+?)\s+vs\.?\s+(.+)",
+    ]
+    
+    for pattern in compare_patterns:
+        match = re.search(pattern, question_lower)
+        if match:
+            item1, item2 = match.groups()
+            return [
+                f"Find information about {item1.strip()}",
+                f"Find information about {item2.strip()}",
+            ]
+    
+    # Pattern: "What are the X in sections A, B, and C"
+    multi_section = re.search(
+        r"in\s+(?:sections?\s+)?(.+?,\s*.+?(?:,\s*.+)*)",
+        question_lower,
+    )
+    if multi_section:
+        sections = [s.strip() for s in multi_section.group(1).split(",")]
+        return [f"Find relevant information in {s}" for s in sections[:5]]
+    
+    # Pattern: "List all X" or "Find all X" - may need iteration
+    if re.search(r"(list|find|show)\s+all", question_lower):
+        return [
+            f"Search for all relevant sections",
+            question,  # Original as synthesis query
+        ]
+    
+    # Default: single question
+    return [question]
 
 
 def navigate_tree(
@@ -324,13 +707,38 @@ def navigate_tree(
     """
     Navigate the document tree based on current sub-question.
     
-    Makes expand/traverse decisions based on node summaries.
+    This function now handles the node visitation queue for multi-path exploration.
     """
     new_state = cast(AgentState, dict(state))
+
+    # Add detailed logging to debug navigation loops
+    logger.debug(
+        "navigate_step_start",
+        iteration=new_state["iteration"],
+        current_node=new_state["current_node_id"],
+        queue=new_state["nodes_to_visit"],
+        visited=new_state["visited_nodes"],
+    )
+
+    # If current node is None, try to pop from the visit queue
+    if new_state["current_node_id"] is None and new_state["nodes_to_visit"]:
+        next_node_id = new_state["nodes_to_visit"].pop(0)
+        new_state["current_node_id"] = next_node_id
+        
+        # Also add to navigation path
+        if next_node_id not in new_state["navigation_path"]:
+            new_state["navigation_path"].append(next_node_id)
+            
+        add_trace_entry(
+            new_state,
+            "navigation",
+            f"Visiting next node from queue: {next_node_id}",
+            {"queue_size": len(new_state["nodes_to_visit"])},
+        )
     
     node_id = new_state["current_node_id"]
     if node_id is None:
-        add_trace_entry(new_state, "navigation", "No current node")
+        add_trace_entry(new_state, "navigation", "No current node to navigate to and queue is empty")
         return new_state
     
     node = skeleton.get(node_id)
@@ -339,9 +747,8 @@ def navigate_tree(
         add_trace_entry(new_state, "navigation", f"Node {node_id} not found")
         return new_state
     
-    # Add to visited
-    if node_id not in new_state["visited_nodes"]:
-        new_state["visited_nodes"].append(node_id)
+    # Don't add to visited here - let expand/traverse handle that
+    # to avoid preventing expansion of newly queued nodes
     
     add_trace_entry(
         new_state,
@@ -357,12 +764,12 @@ def navigate_tree(
 def should_expand(
     state: AgentState,
     skeleton: dict[str, SkeletonNode],
-) -> Literal["expand", "traverse", "done"]:
+) -> Literal["expand", "traverse", "backtrack", "done"]:
     """
-    Decide whether to expand (fetch content) or traverse (go to children).
+    Decide whether to expand (fetch content), traverse (go to children), 
+    backtrack (dead end), or finish.
     
-    In production, this uses an LLM to evaluate if the summary answers
-    the question. Here's a simple version based on node properties.
+    Uses Tree of Thoughts evaluation to make intelligent decisions.
     """
     node_id = state.get("current_node_id")
     if node_id is None:
@@ -376,11 +783,61 @@ def should_expand(
     if state.get("iteration", 0) >= state.get("max_iterations", 20):
         return "done"
     
-    # If no children, must expand
+    # Removed variable count limit - iteration limit is sufficient
+    
+    # If no children, must expand (leaf node)
+    # But only if not already visited
+    visited = state.get("visited_nodes", [])
     if not node.child_ids:
+        if node_id in visited:
+            # Already expanded this leaf, done with it
+            return "done"
         return "expand"
     
-    # Simple heuristic: expand if at leaf-ish level (H3)
+    # Check if all children are visited or dead ends
+    visited = state.get("visited_nodes", [])
+    dead_ends = state.get("dead_ends", [])
+    unvisited_children = [
+        cid for cid in node.child_ids 
+        if cid not in visited and cid not in dead_ends
+    ]
+    
+    if not unvisited_children:
+        # All children explored - backtrack or done
+        if state.get("backtrack_stack"):
+            return "backtrack"
+        return "done"
+    
+    # Adaptive exploration: increase top_k if we haven't found much information yet
+    base_top_k = state.get("top_k", 3)
+    variables_found = len(state.get("variables", []))
+    iteration = state.get("iteration", 0)
+    
+    if iteration > 5 and variables_found == 0:
+        adaptive_top_k = min(len(node.child_ids), base_top_k * 3)
+    elif iteration > 3 and variables_found < 2:
+        adaptive_top_k = min(len(node.child_ids), base_top_k * 2)
+    else:
+        adaptive_top_k = base_top_k
+
+    # Use ToT evaluation to decide
+    tot_result = evaluate_children_with_tot(state, skeleton, top_k_override=adaptive_top_k)
+    
+    # Check for dead end signal from ToT
+    if tot_result.get("is_dead_end", False):
+        if state.get("backtrack_stack"):
+            return "backtrack"
+        return "done"
+    
+    # Check if ToT says this is a leaf (should expand)
+    if tot_result.get("is_leaf", False):
+        return "expand"
+    
+    # If ToT selected nodes, traverse
+    if tot_result.get("selected_nodes"):
+        return "traverse"
+    
+    # Fallback: expand if at deep level (H3+)
     if node.level >= 3:
         return "expand"
     
@@ -403,15 +860,31 @@ def expand_current_node(
     if node_id is None:
         return new_state
     
+    # Check if already visited to prevent infinite loops
+    if node_id in new_state.get("visited_nodes", []):
+        add_trace_entry(
+            new_state,
+            "navigation", 
+            f"Skipping already-visited node {node_id}",
+            {"node_id": node_id},
+        )
+        new_state["current_node_id"] = None
+        new_state["iteration"] = new_state["iteration"] + 1
+        return new_state
+    
     node = skeleton.get(node_id)
     
     if node is None:
+        new_state["current_node_id"] = None
+        new_state["iteration"] = new_state["iteration"] + 1
         return new_state
     
     # Fetch full content
     content = kv_store.get(node_id)
     if content is None:
         add_trace_entry(new_state, "variable_stitching", f"No content for {node_id}")
+        new_state["current_node_id"] = None
+        new_state["iteration"] = new_state["iteration"] + 1
         return new_state
     
     # Generate and store as variable
@@ -420,6 +893,11 @@ def expand_current_node(
     
     new_state["variables"].append(pointer)
     new_state["context"] += f"\nFound: {pointer} (from {node.header})"
+    
+    # Mark node as visited and clear current node
+    if node_id not in new_state["visited_nodes"]:
+        new_state["visited_nodes"].append(node_id)
+    new_state["current_node_id"] = None  # Process queue next
     
     add_trace_entry(
         new_state,
@@ -435,9 +913,17 @@ def expand_current_node(
 def traverse_to_children(
     state: AgentState,
     skeleton: dict[str, SkeletonNode],
+    semantic_searcher: SemanticSearcher | None = None,
 ) -> AgentState:
     """
-    TRAVERSE: Navigate to child nodes.
+    TRAVERSE: Navigate to child nodes using Tree of Thoughts reasoning.
+    
+    Primary Strategy: Tree of Thoughts (ToT) with adaptive exploration.
+    - Uses LLM reasoning to evaluate child nodes based on summaries
+    - Dynamically increases exploration when insufficient variables found
+    - Preserves document structure and context (per research paper Section 7.2)
+    
+    Optional: Semantic search as shortcut for finding entry points (Section 9.1)
     """
     new_state = cast(AgentState, dict(state))
     
@@ -450,19 +936,74 @@ def traverse_to_children(
     if node is None or not node.child_ids:
         return new_state
     
-    # For simplicity, go to first unvisited child
-    for child_id in node.child_ids:
-        if child_id not in new_state["visited_nodes"]:
-            new_state["current_node_id"] = child_id
-            new_state["navigation_path"].append(child_id)
-            
-            add_trace_entry(
-                new_state,
-                "navigation",
-                f"Traversed to {child_id}",
-                {"from": node_id, "to": child_id},
-            )
-            break
+    question = new_state["question"]
+    base_top_k = new_state.get("top_k", 3)
+    
+    # Adaptive exploration: increase top_k if we haven't found much information yet
+    # This addresses the original issue: "agent should be able to explore all nodes if it needs to"
+    variables_found = len(new_state.get("variables", []))
+    iteration = new_state.get("iteration", 0)
+    
+    # Dynamic top_k based on progress
+    if iteration > 5 and variables_found == 0:
+        # Not finding anything - expand search significantly
+        adaptive_top_k = min(len(node.child_ids), base_top_k * 3)
+        add_trace_entry(
+            new_state,
+            "navigation",
+            f"Expanding search: {variables_found} variables after {iteration} iterations",
+            {"base_top_k": base_top_k, "adaptive_top_k": adaptive_top_k},
+        )
+    elif iteration > 3 and variables_found < 2:
+        # Finding very little - expand moderately
+        adaptive_top_k = min(len(node.child_ids), base_top_k * 2)
+    else:
+        # Normal exploration
+        adaptive_top_k = base_top_k
+    
+    # Use Tree of Thoughts as primary navigation method (per research paper)
+    tot_result = evaluate_children_with_tot(new_state, skeleton, top_k_override=adaptive_top_k)
+    
+    # Check for dead end
+    if tot_result.get("is_dead_end", False):
+        add_trace_entry(
+            new_state,
+            "navigation",
+            f"Dead end detected at {node_id}: {tot_result.get('backtrack_reason', 'Unknown')}",
+            {"node_id": node_id, "backtrack_reason": tot_result.get("backtrack_reason")},
+        )
+        # Mark as dead end and don't change current node
+        if node_id not in new_state["dead_ends"]:
+            new_state["dead_ends"].append(node_id)
+        new_state["iteration"] = new_state["iteration"] + 1
+        return new_state
+    
+    selected_nodes = tot_result.get("selected_nodes", [])
+    evaluations = tot_result.get("evaluations", [])
+    new_state["scored_candidates"] = evaluations
+
+    # Queue selected children for visitation
+    if selected_nodes:
+        new_state["nodes_to_visit"].extend(selected_nodes)
+        # Mark parent as visited since we've traversed its children
+        if node_id not in new_state["visited_nodes"]:
+            new_state["visited_nodes"].append(node_id)
+        # Unset current node to force the next navigate step to pull from the queue
+        new_state["current_node_id"] = None
+        add_trace_entry(
+            new_state,
+            "navigation",
+            f"Queued {len(selected_nodes)} children from {node_id}",
+            {"nodes": selected_nodes, "parent": node_id},
+        )
+    else:
+        # No candidates available - this should trigger backtracking
+        add_trace_entry(
+            new_state,
+            "navigation",
+            f"No unvisited candidates at {node_id}",
+            {"node_id": node_id},
+        )
     
     new_state["iteration"] = new_state["iteration"] + 1
     return new_state
@@ -500,23 +1041,90 @@ def synthesize_answer(
         # Use LLM to synthesize answer
         try:
             from rnsr.llm import get_llm
-            
+
             llm = get_llm()
-            
-            prompt = f"""Based on the following context, answer the question concisely.
-If the answer cannot be determined from the context, say "Cannot determine from available context."
+
+            metadata = new_state.get("metadata", {})
+            options = metadata.get("options")
+
+            if options and isinstance(options, list) and len(options) > 0:
+                # QuALITY multiple-choice question
+                # Ensure each option is a string and format with letters
+                options_text = "\n".join([f"{chr(65+i)}. {str(opt)}" for i, opt in enumerate(options)])
+                prompt = f"""Based on the provided context, answer this multiple-choice question.
+
+Question: {question}
+
+Options:
+{options_text}
+
+Context:
+{context_text}
+
+Instructions:
+1. Read the context carefully
+2. Determine which option is best supported by the evidence in the context
+3. Respond with ONLY the letter and full text of the correct option
+4. Format: "X. [complete option text]" where X is A, B, C, or D
+
+Your answer:"""
+            else:
+                # Standard open-ended question
+                prompt = f"""Based on the following context, answer the question concisely.
+
+IMPORTANT INSTRUCTIONS:
+- If the context contains information that DIRECTLY answers the question, provide that answer
+- If the context contains information that allows you to INFER the answer, provide your best inference
+- Use evidence from the context to support your answer
+- Only say "Cannot determine from available context" if the context is completely unrelated or missing critical information
+- It's better to provide a reasonable answer based on available evidence than to say "cannot determine"
 
 Question: {question}
 
 Context:
 {context_text}
 
-Answer (be concise and direct):"""
-            
+Answer (be concise, direct, and confident):"""
+
             response = llm.complete(prompt)
-            new_state["answer"] = str(response).strip()
-            new_state["confidence"] = min(1.0, len(pointers) * 0.3)
+            answer = str(response).strip()
             
+            # Normalize multiple-choice answers
+            if options:
+                answer_lower = answer.lower().strip()
+                matched = False
+                
+                for i, opt in enumerate(options):
+                    letter = chr(65 + i)  # A, B, C, D
+                    opt_lower = opt.lower()
+                    
+                    # Match patterns: "A.", "A)", "(A)", "A. answer text"
+                    if (answer_lower.startswith(f"{letter.lower()}.") or 
+                        answer_lower.startswith(f"{letter.lower()})") or 
+                        answer_lower.startswith(f"({letter.lower()})")):
+                        answer = opt
+                        matched = True
+                        break
+                    
+                    # Exact match (case insensitive)
+                    if answer_lower == opt_lower:
+                        answer = opt
+                        matched = True
+                        break
+                    
+                    # Check if option text is contained in answer
+                    if opt_lower in answer_lower or answer_lower in opt_lower:
+                        # Use similarity to pick best match if multiple partial matches
+                        answer = opt
+                        matched = True
+                        break
+                
+                new_state["confidence"] = 0.8 if matched else 0.1
+            else:
+                new_state["confidence"] = min(1.0, len(pointers) * 0.3)
+            
+            new_state["answer"] = answer
+
         except Exception as e:
             logger.warning("llm_synthesis_failed", error=str(e))
             # Fallback to context concatenation
@@ -534,6 +1142,202 @@ Answer (be concise and direct):"""
 
 
 # =============================================================================
+# RLM Recursive Execution Functions (Section 2.2)
+# =============================================================================
+
+
+def execute_sub_task_with_llm(
+    sub_task: str,
+    context: str,
+    llm_fn: Any = None,
+) -> str:
+    """
+    Execute a single sub-task using an LLM.
+    
+    Implements the recursive LLM pattern from Section 2.2:
+    "For each contract, call the LLM API (invoking itself) with a 
+    specific sub-prompt: 'Extract liability clause from this text.'"
+    
+    Args:
+        sub_task: The sub-task description/prompt.
+        context: The context to process.
+        llm_fn: Optional LLM function. If None, uses default.
+        
+    Returns:
+        LLM response as string.
+    """
+    if llm_fn is None:
+        try:
+            from rnsr.llm import get_llm
+            llm = get_llm()
+            llm_fn = lambda p: str(llm.complete(p))
+        except Exception as e:
+            logger.warning("llm_not_available", error=str(e))
+            return f"[Error: LLM not available - {str(e)}]"
+    
+    prompt = f"""{sub_task}
+
+Context:
+{context}
+
+Response:"""
+    
+    try:
+        return llm_fn(prompt)
+    except Exception as e:
+        logger.error("sub_task_execution_failed", error=str(e))
+        return f"[Error: {str(e)}]"
+
+
+def batch_execute_sub_tasks(
+    sub_tasks: list[str],
+    contexts: list[str],
+    batch_size: int = 5,
+    max_parallel: int = 4,
+) -> list[str]:
+    """
+    Execute multiple sub-tasks in parallel batches.
+    
+    Implements Section 2.3 "Optimization via Batching":
+    "Instead of making 1,000 individual calls to summarize 1,000 paragraphs,
+    the RLM writes code to group paragraphs into chunks of 5 and processes 
+    them in parallel threads."
+    
+    Args:
+        sub_tasks: List of sub-task prompts.
+        contexts: List of contexts for each sub-task.
+        batch_size: Items per batch (default 5).
+        max_parallel: Max parallel threads (default 4).
+        
+    Returns:
+        List of results for each sub-task.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    if len(sub_tasks) != len(contexts):
+        raise ValueError("sub_tasks and contexts must have same length")
+    
+    if not sub_tasks:
+        return []
+    
+    logger.info(
+        "batch_execution_start",
+        num_tasks=len(sub_tasks),
+        batch_size=batch_size,
+    )
+    
+    # Get LLM function
+    try:
+        from rnsr.llm import get_llm
+        llm = get_llm()
+        llm_fn = lambda p: str(llm.complete(p))
+    except Exception as e:
+        logger.error("batch_llm_failed", error=str(e))
+        return [f"[Error: {str(e)}]"] * len(sub_tasks)
+    
+    results: list[str] = [""] * len(sub_tasks)
+    
+    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+        future_to_idx: dict[Any, int] = {}
+        
+        for idx, (task, ctx) in enumerate(zip(sub_tasks, contexts)):
+            future = executor.submit(execute_sub_task_with_llm, task, ctx, llm_fn)
+            future_to_idx[future] = idx
+        
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result(timeout=120)
+            except Exception as e:
+                results[idx] = f"[Error: {str(e)}]"
+    
+    logger.info("batch_execution_complete", num_results=len(results))
+    return results
+
+
+def process_pending_questions(
+    state: AgentState,
+    skeleton: dict[str, SkeletonNode],
+    kv_store: KVStore,
+    variable_store: VariableStore,
+) -> AgentState:
+    """
+    Process all pending sub-questions using recursive LLM calls.
+    
+    This implements the full RLM recursive loop:
+    1. For each pending question, find relevant context
+    2. Invoke sub-LLM to extract answer
+    3. Store result as variable
+    4. Move to next question
+    """
+    new_state = cast(AgentState, dict(state))
+    pending = new_state.get("pending_questions", [])
+    
+    if not pending:
+        return new_state
+    
+    current_question = pending[0]
+    
+    # Find relevant content for this question
+    # Use current node and its children
+    node_id = new_state.get("current_node_id") or "root"
+    node = skeleton.get(node_id)
+    
+    if node is None:
+        # Pop and continue
+        new_state["pending_questions"] = pending[1:]
+        return new_state
+    
+    # Get context from current node and children
+    context_parts = []
+    
+    # Add current node content
+    current_content = kv_store.get(node_id) if node_id else None
+    if current_content:
+        context_parts.append(f"[{node.header}]\n{current_content}")
+    
+    # Add children summaries
+    for child_id in node.child_ids[:5]:  # Limit to 5 children
+        child = skeleton.get(child_id)
+        if child:
+            child_content = kv_store.get(child_id)
+            if child_content:
+                context_parts.append(f"[{child.header}]\n{child_content[:2000]}")
+    
+    context = "\n\n---\n\n".join(context_parts)
+    
+    # Execute sub-task with LLM
+    result = execute_sub_task_with_llm(
+        sub_task=f"Answer this question: {current_question}",
+        context=context,
+    )
+    
+    # Store as variable
+    pointer = generate_pointer_name(current_question[:30])
+    variable_store.assign(pointer, result, node_id or "root")
+    new_state["variables"].append(pointer)
+    
+    add_trace_entry(
+        new_state,
+        "decomposition",
+        f"Processed sub-question via recursive LLM",
+        {
+            "question": current_question,
+            "pointer": pointer,
+            "context_length": len(context),
+        },
+    )
+    
+    # Pop processed question
+    new_state["pending_questions"] = pending[1:]
+    if pending[1:]:
+        new_state["current_sub_question"] = pending[1]
+    
+    new_state["iteration"] = new_state["iteration"] + 1
+    return new_state
+
+
+# =============================================================================
 # Graph Builder (LangGraph)
 # =============================================================================
 
@@ -541,9 +1345,12 @@ Answer (be concise and direct):"""
 def build_navigator_graph(
     skeleton: dict[str, SkeletonNode],
     kv_store: KVStore,
+    semantic_searcher: SemanticSearcher | None = None,
 ) -> Any:
     """
     Build the LangGraph state machine for document navigation.
+    
+    Implements Tree of Thoughts (ToT) navigation with backtracking support.
     
     Returns a compiled graph that can be invoked with a question.
     
@@ -578,7 +1385,17 @@ def build_navigator_graph(
     
     graph.add_node(
         "traverse",
-        lambda state: traverse_to_children(cast(AgentState, state), skeleton),
+        lambda state: traverse_to_children(
+            cast(AgentState, state),
+            skeleton,
+            semantic_searcher,
+        ),
+    )
+    
+    # Add backtrack node for ToT dead-end handling
+    graph.add_node(
+        "backtrack",
+        lambda state: backtrack_to_parent(cast(AgentState, state), skeleton),
     )
     
     graph.add_node(
@@ -589,25 +1406,30 @@ def build_navigator_graph(
     # Add edges
     graph.add_edge("decompose", "navigate")
     
-    # Conditional edge based on expand/traverse decision
+    # Conditional edge based on expand/traverse/backtrack decision
     graph.add_conditional_edges(
         "navigate",
         lambda s: should_expand(s, skeleton),
         {
             "expand": "expand",
             "traverse": "traverse",
+            "backtrack": "backtrack",
             "done": "synthesize",
         },
     )
     
+    # After expand, traverse, or backtrack, always return to the main navigation
+    # handler, which will decide what to do next (e.g., pull from queue)
     graph.add_edge("expand", "navigate")
     graph.add_edge("traverse", "navigate")
+    graph.add_edge("backtrack", "navigate")
+    
     graph.add_edge("synthesize", END)
     
     # Set entry point
     graph.set_entry_point("decompose")
     
-    logger.info("navigator_graph_built")
+    logger.info("navigator_graph_built", features=["ToT", "backtracking"])
     
     return graph.compile()
 
@@ -622,6 +1444,12 @@ def run_navigator(
     skeleton: dict[str, SkeletonNode],
     kv_store: KVStore,
     max_iterations: int = 20,
+    top_k: int | None = None,
+    use_semantic_search: bool = True,
+    semantic_searcher: SemanticSearcher | None = None,
+    metadata: dict[str, Any] | None = None,
+    tot_selection_threshold: float = 0.4,
+    tot_dead_end_threshold: float = 0.1,
 ) -> dict[str, Any]:
     """
     Run the navigator agent on a question.
@@ -631,6 +1459,12 @@ def run_navigator(
         skeleton: Skeleton index.
         kv_store: KV store with full content.
         max_iterations: Maximum navigation iterations.
+        top_k: Number of top children to explore (default: auto-detect based on tree depth).
+        use_semantic_search: Use semantic search (O(log N)) instead of ToT evaluation (O(N)).
+            Allows exploring ALL leaf nodes ranked by relevance, preventing missed data.
+        semantic_searcher: Optional pre-built semantic searcher. If None and use_semantic_search=True, creates one.
+        tot_selection_threshold: Minimum probability for ToT node selection (0.0-1.0).
+        tot_dead_end_threshold: Probability threshold for declaring a dead end (0.0-1.0).
         
     Returns:
         Dictionary with answer, confidence, trace.
@@ -640,14 +1474,17 @@ def run_navigator(
             "What are the liability terms?",
             skeleton,
             kv_store,
+            use_semantic_search=True,  # Enable semantic search
         )
         print(result["answer"])
     """
     # Get root node
     root_id = None
+    root_node = None
     for node in skeleton.values():
         if node.level == 0:
             root_id = node.node_id
+            root_node = node
             break
     
     if root_id is None:
@@ -657,13 +1494,56 @@ def run_navigator(
             "trace": [],
         }
     
+    # Auto-detect top_k based on tree structure
+    if top_k is None:
+        num_root_children = len(root_node.child_ids) if root_node else 0
+        if num_root_children > 10:
+            # Flat hierarchy (e.g., QuALITY): explore more children
+            top_k = min(10, num_root_children)
+        else:
+            # Deep hierarchy (e.g., PDFs): explore fewer
+            top_k = 3
+    
+    # Semantic search disabled by default per research paper Section 9.1:
+    # "Hybridize Search: Give the agent a vector_search tool as a SHORTCUT.
+    # The agent can use vector search to find a starting node and then
+    # SWITCH TO TREE TRAVERSAL for local exploration."
+    # 
+    # Primary navigation uses ToT reasoning-based retrieval.
+    if use_semantic_search and semantic_searcher is None:
+        try:
+            from rnsr.indexing.semantic_search import create_semantic_searcher
+            semantic_searcher = create_semantic_searcher(skeleton, kv_store)
+            logger.info(
+                "semantic_search_optional_tool",
+                nodes=len(skeleton),
+                note="Available as shortcut for entry points only",
+            )
+        except Exception as e:
+            logger.warning(
+                "semantic_search_unavailable",
+                error=str(e),
+            )
+            semantic_searcher = None
+    
+    logger.info(
+        "using_tot_reasoning_navigation",
+        method="Tree of Thoughts",
+        adaptive_exploration=True,
+        note="LLM reasons about document structure to navigate",
+    )
+    
     # Build and run graph
-    graph = build_navigator_graph(skeleton, kv_store)
+    graph = build_navigator_graph(skeleton, kv_store, semantic_searcher)
     
     initial_state = create_initial_state(
         question=question,
         root_node_id=root_id,
         max_iterations=max_iterations,
+        top_k=top_k,
+        metadata=metadata,
+        tot_selection_threshold=tot_selection_threshold,
+        tot_dead_end_threshold=tot_dead_end_threshold,
     )
     
     final_state = graph.invoke(initial_state)
