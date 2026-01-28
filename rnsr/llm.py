@@ -6,6 +6,11 @@ Supports:
 - Anthropic (Claude)
 - Google Gemini (gemini-pro, text-embedding-004)
 
+Features:
+- Automatic rate limit handling with exponential backoff
+- Cross-provider fallback on 429/quota errors
+- Provider priority chain for resilience
+
 Usage:
     from rnsr.llm import get_llm, get_embed_model, LLMProvider
     
@@ -21,9 +26,10 @@ Usage:
 from __future__ import annotations
 
 import os
+import time
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar, Union
 
 import structlog
 from tenacity import (
@@ -33,6 +39,8 @@ from tenacity import (
     retry_if_exception_type,
     before_sleep_log,
 )
+
+T = TypeVar("T")
 
 # Load .env file if it exists
 try:
@@ -73,6 +81,57 @@ DEFAULT_MODELS = {
     },
 }
 
+# Fallback chain when a provider hits rate limits
+PROVIDER_FALLBACK_CHAIN = {
+    LLMProvider.GEMINI: [LLMProvider.OPENAI, LLMProvider.ANTHROPIC],
+    LLMProvider.OPENAI: [LLMProvider.ANTHROPIC, LLMProvider.GEMINI],
+    LLMProvider.ANTHROPIC: [LLMProvider.OPENAI, LLMProvider.GEMINI],
+}
+
+
+def is_rate_limit_error(error: Exception) -> bool:
+    """Check if an error is a rate limit/quota error that should trigger fallback."""
+    error_str = str(error).lower()
+    
+    # Check for common rate limit indicators
+    rate_limit_indicators = [
+        "429",
+        "rate limit",
+        "rate_limit",
+        "quota exceeded",
+        "quota_exceeded",
+        "resource exhausted",
+        "resourceexhausted",
+        "too many requests",
+        "overloaded",
+    ]
+    
+    for indicator in rate_limit_indicators:
+        if indicator in error_str:
+            return True
+    
+    # Check for specific exception types
+    try:
+        from google.api_core import exceptions as google_exceptions
+        if isinstance(error, (
+            google_exceptions.ResourceExhausted,
+            google_exceptions.TooManyRequests,
+        )):
+            return True
+    except ImportError:
+        pass
+    
+    return False
+
+
+def get_available_fallback_providers(primary: LLMProvider) -> list[LLMProvider]:
+    """Get list of available fallback providers for a given primary provider."""
+    fallbacks = []
+    for provider in PROVIDER_FALLBACK_CHAIN.get(primary, []):
+        if validate_provider(provider):
+            fallbacks.append(provider)
+    return fallbacks
+
 
 def detect_provider() -> LLMProvider:
     """
@@ -110,6 +169,7 @@ def detect_provider() -> LLMProvider:
 def get_llm(
     provider: LLMProvider = LLMProvider.AUTO,
     model: str | None = None,
+    enable_fallback: bool = True,
     **kwargs: Any,
 ) -> Any:
     """
@@ -118,10 +178,11 @@ def get_llm(
     Args:
         provider: LLM provider (openai, anthropic, gemini, or auto).
         model: Model name override. Uses default if not specified.
+        enable_fallback: If True, enables cross-provider fallback on rate limits.
         **kwargs: Additional arguments passed to the LLM constructor.
         
     Returns:
-        LlamaIndex-compatible LLM instance.
+        LlamaIndex-compatible LLM instance with fallback support.
         
     Example:
         llm = get_llm(provider=LLMProvider.GEMINI)
@@ -132,6 +193,34 @@ def get_llm(
     
     model = model or DEFAULT_MODELS[provider]["llm"]
     
+    # Get primary LLM
+    primary_llm = _get_raw_llm(provider, model, **kwargs)
+    
+    if not enable_fallback:
+        return primary_llm
+    
+    # Build fallback chain
+    fallback_providers = get_available_fallback_providers(provider)
+    if not fallback_providers:
+        logger.debug("no_fallback_providers_available", primary=provider.value)
+        return primary_llm
+    
+    logger.debug(
+        "llm_with_fallback_configured",
+        primary=provider.value,
+        fallbacks=[p.value for p in fallback_providers],
+    )
+    
+    return ResilientLLMWrapper(
+        primary_llm=primary_llm,
+        primary_provider=provider,
+        fallback_providers=fallback_providers,
+        **kwargs,
+    )
+
+
+def _get_raw_llm(provider: LLMProvider, model: str, **kwargs: Any) -> Any:
+    """Get a raw LLM instance without fallback wrapper."""
     if provider == LLMProvider.OPENAI:
         return _get_openai_llm(model, **kwargs)
     elif provider == LLMProvider.ANTHROPIC:
@@ -190,6 +279,156 @@ def get_embed_model(
         return _get_gemini_embed(model, **kwargs)
     else:
         raise ValueError(f"Unknown embedding provider: {provider}")
+
+
+# =============================================================================
+# Resilient LLM Wrapper with Cross-Provider Fallback
+# =============================================================================
+
+
+class ResilientLLMWrapper:
+    """
+    LLM wrapper that provides cross-provider fallback on rate limits.
+    
+    When the primary provider hits a 429/quota error, automatically switches
+    to fallback providers in order until one succeeds.
+    """
+    
+    def __init__(
+        self,
+        primary_llm: Any,
+        primary_provider: LLMProvider,
+        fallback_providers: list[LLMProvider],
+        max_retries: int = 3,
+        retry_delay: float = 2.0,
+        **kwargs: Any,
+    ):
+        self.primary_llm = primary_llm
+        self.primary_provider = primary_provider
+        self.fallback_providers = fallback_providers
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.kwargs = kwargs
+        
+        # Lazily initialized fallback LLMs
+        self._fallback_llms: dict[LLMProvider, Any] = {}
+        
+        # Track which provider we're currently using
+        self._current_provider = primary_provider
+        self._rate_limited_until: dict[LLMProvider, float] = {}
+    
+    def _get_fallback_llm(self, provider: LLMProvider) -> Any:
+        """Get or create a fallback LLM instance."""
+        if provider not in self._fallback_llms:
+            model = DEFAULT_MODELS[provider]["llm"]
+            self._fallback_llms[provider] = _get_raw_llm(provider, model, **self.kwargs)
+            logger.info("fallback_llm_initialized", provider=provider.value, model=model)
+        return self._fallback_llms[provider]
+    
+    def _is_rate_limited(self, provider: LLMProvider) -> bool:
+        """Check if a provider is currently rate limited."""
+        if provider not in self._rate_limited_until:
+            return False
+        return time.time() < self._rate_limited_until[provider]
+    
+    def _mark_rate_limited(self, provider: LLMProvider, duration: float = 60.0):
+        """Mark a provider as rate limited for a duration."""
+        self._rate_limited_until[provider] = time.time() + duration
+        logger.warning(
+            "provider_rate_limited",
+            provider=provider.value,
+            cooldown_seconds=duration,
+        )
+    
+    def _get_available_llms(self) -> list[tuple[LLMProvider, Any]]:
+        """Get list of available LLMs in priority order."""
+        llms = []
+        
+        # Primary first (if not rate limited)
+        if not self._is_rate_limited(self.primary_provider):
+            llms.append((self.primary_provider, self.primary_llm))
+        
+        # Then fallbacks
+        for provider in self.fallback_providers:
+            if not self._is_rate_limited(provider):
+                llms.append((provider, self._get_fallback_llm(provider)))
+        
+        # If all are rate limited, try primary anyway (it might work now)
+        if not llms:
+            llms.append((self.primary_provider, self.primary_llm))
+        
+        return llms
+    
+    def _call_with_fallback(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        """Call a method with automatic fallback on rate limits."""
+        last_error = None
+        
+        for provider, llm in self._get_available_llms():
+            for attempt in range(self.max_retries):
+                try:
+                    method = getattr(llm, method_name)
+                    result = method(*args, **kwargs)
+                    
+                    # Success - update current provider
+                    if provider != self._current_provider:
+                        logger.info(
+                            "switched_to_fallback_provider",
+                            from_provider=self._current_provider.value,
+                            to_provider=provider.value,
+                        )
+                        self._current_provider = provider
+                    
+                    return result
+                    
+                except Exception as e:
+                    last_error = e
+                    
+                    if is_rate_limit_error(e):
+                        logger.warning(
+                            "rate_limit_hit",
+                            provider=provider.value,
+                            attempt=attempt + 1,
+                            error=str(e)[:200],
+                        )
+                        
+                        # Mark provider as rate limited and try next
+                        self._mark_rate_limited(provider, duration=60.0)
+                        break  # Move to next provider
+                    else:
+                        # Non-rate-limit error - retry with exponential backoff
+                        if attempt < self.max_retries - 1:
+                            delay = self.retry_delay * (2 ** attempt)
+                            logger.debug(
+                                "retrying_after_error",
+                                provider=provider.value,
+                                attempt=attempt + 1,
+                                delay=delay,
+                                error=str(e)[:100],
+                            )
+                            time.sleep(delay)
+                        else:
+                            # All retries exhausted for this provider
+                            break
+        
+        # All providers failed
+        logger.error(
+            "all_providers_failed",
+            primary=self.primary_provider.value,
+            fallbacks=[p.value for p in self.fallback_providers],
+        )
+        raise last_error or RuntimeError("All LLM providers failed")
+    
+    def complete(self, prompt: str, **kwargs: Any) -> Any:
+        """Complete a prompt with fallback support."""
+        return self._call_with_fallback("complete", prompt, **kwargs)
+    
+    def chat(self, messages: Any, **kwargs: Any) -> Any:
+        """Chat with fallback support."""
+        return self._call_with_fallback("chat", messages, **kwargs)
+    
+    def __getattr__(self, name: str) -> Any:
+        """Forward other attributes to the current LLM."""
+        return getattr(self.primary_llm, name)
 
 
 # =============================================================================
@@ -359,7 +598,7 @@ def _get_gemini_llm(model: str, **kwargs: Any) -> Any:
                     self.model_name = model_name
                     self.primary = Gemini(model=model_name, **kwargs)
                     # Fallback to older stable model or preview
-                    self.fallback_model = "models/gemini-1.5-flash"
+                    self.fallback_model = "models/gemini-3-flash-preview"
                     self.fallback = Gemini(model=self.fallback_model, **kwargs)
                 
                 @retry(

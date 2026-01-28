@@ -1,29 +1,24 @@
 """
-Agent Module - Recursive Navigator with RLM Support
+Agent Module - Recursive Navigator with Full RLM Support
 
-Implements Phase III from Section 5.1 of the research paper:
-"The Recursive REPL Agent (The Navigator)"
+Implements the state-of-the-art hybrid retrieval system combining:
+- PageIndex: Vectorless, reasoning-based tree search
+- RLMs: REPL environment with recursive sub-LLM calls  
+- RNSR: Latent hierarchy reconstruction + variable stitching
 
-And Section 2 "The Recursive Language Model (RLM)":
-- Prompt-as-Environment abstraction (DOC_VAR)
-- Recursive sub-LLM invocation for sub-task decomposition
-- Variable Stitching to prevent Context Rot
-- Batched parallel processing for efficiency
-
-Provides:
-1. REPLEnvironment - Python REPL with DOC_VAR and code execution
-2. NavigatorAPI - REPL environment with list_children, read_node, search_index
+Key Features:
+1. RLM Navigator - Full recursive language model with pre-filtering
+2. REPLEnvironment - Python REPL with DOC_VAR and code execution
 3. Variable Store - Pointer-based stitching to prevent context pollution
-4. LangGraph state machine - Cyclic control flow for RAP
-5. RAP execution - Reasoning via Planning query loop
-6. Tree of Thoughts (ToT) Prompting - Section 7.2
-7. Recursive Decomposition - LLM-based sub-task generation
-8. Batch Processing - Parallel sub-LLM calls
+4. Tree of Thoughts (ToT) - LLM-based navigation decisions
+5. Pre-filtering - Keyword/regex filtering before LLM calls
+6. Deep Recursion - Multi-level recursive sub-LLM calls
+7. Answer Verification - Sub-LLM validation of answers
+8. Async Processing - Parallel sub-LLM execution
 
-ToT Features:
-- LLM-based child node evaluation with probability scoring
-- Top-k selection of most promising navigation paths
-- Automatic backtracking from dead ends
+Inspired by:
+- PageIndex (VectifyAI): https://github.com/VectifyAI/PageIndex
+- Recursive Language Models: https://arxiv.org/html/2512.24601v1
 """
 
 from rnsr.agent.graph import (
@@ -54,8 +49,27 @@ from rnsr.agent.repl_env import (
     RLM_SYSTEM_PROMPT,
     batch_process_async,
 )
+from rnsr.agent.rlm_navigator import (
+    RLMNavigator,
+    RLMConfig,
+    RLMAgentState,
+    PreFilterEngine,
+    RecursiveSubLLMEngine,
+    AnswerVerificationEngine,
+    create_rlm_navigator,
+    run_rlm_navigator,
+)
 
 __all__ = [
+    # RLM Navigator (State-of-the-Art)
+    "RLMNavigator",
+    "RLMConfig",
+    "RLMAgentState",
+    "PreFilterEngine",
+    "RecursiveSubLLMEngine",
+    "AnswerVerificationEngine",
+    "create_rlm_navigator",
+    "run_rlm_navigator",
     # REPL Environment (Section 2.1 - Prompt-as-Environment)
     "REPLEnvironment",
     "create_repl_environment",

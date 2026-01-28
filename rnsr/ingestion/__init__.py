@@ -1,10 +1,11 @@
 """
-Ingestion Module - Latent TOC Reconstruction
+Ingestion Module - Latent TOC Reconstruction + Vision Retrieval
 
 Implements the "Latent Hierarchy Generator" from the research paper (Section 4):
 - Visual-Geometric Analysis (Font Histogram + XY-Cut)
 - Semantic Boundary Detection (SemanticSplitter + Hierarchical Clustering)
 - Synthetic Header Generation (LLM-based titles for flat documents)
+- Vision-Based Retrieval (OCR-free page image analysis)
 
 Responsible for:
 1. Font Histogram Analysis (PRIMARY - Section 6.1)
@@ -12,6 +13,7 @@ Responsible for:
 3. Hierarchical Clustering (Multi-resolution topics - Section 4.2.2)
 4. Synthetic Header Generation (LLM titles - Section 6.3)
 5. Graceful Degradation (3-tier fallback)
+6. Vision-Based Retrieval (PageIndex-inspired OCR-free mode)
 
 Primary Entry Point:
     ingest_document(pdf_path) -> IngestionResult
@@ -45,6 +47,15 @@ from rnsr.ingestion.layout_model import (
     get_layout_model_info,
     LAYOUT_MODEL_BASE,
     LAYOUT_MODEL_LARGE,
+)
+from rnsr.ingestion.vision_retrieval import (
+    VisionConfig,
+    VisionNavigator,
+    HybridVisionNavigator,
+    PageImageExtractor,
+    VisionLLM,
+    create_vision_navigator,
+    create_hybrid_navigator,
 )
 from rnsr.models import IngestionResult
 
@@ -85,4 +96,12 @@ __all__ = [
     # Tier 3: OCR
     "try_ocr_ingestion",
     "check_ocr_available",
+    # Vision-Based Retrieval (PageIndex-inspired)
+    "VisionConfig",
+    "VisionNavigator",
+    "HybridVisionNavigator",
+    "PageImageExtractor",
+    "VisionLLM",
+    "create_vision_navigator",
+    "create_hybrid_navigator",
 ]

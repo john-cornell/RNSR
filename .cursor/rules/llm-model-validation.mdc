@@ -1,0 +1,45 @@
+---
+description: Verify LLM model names exist before recommending or using them
+alwaysApply: true
+---
+
+# LLM Model Validation
+
+Before setting up LLM calls, recommending models, or modifying LLM configuration code, you MUST verify that the model name is current and valid.
+
+## Required Verification Steps
+
+1. **Check official documentation** using web search before recommending any model:
+   - OpenAI: Search for current model names at docs.openai.com
+   - Anthropic: Search for current model names at docs.anthropic.com  
+   - Google Gemini: Search for current model names at ai.google.dev
+
+2. **Never assume model names** - Model names change frequently:
+   - Models get deprecated (e.g., `gpt-4-turbo` -> `gpt-4o`)
+   - Version formats change (e.g., `gemini-pro` -> `gemini-1.5-pro` -> `gemini-2.0-flash`)
+   - Preview models expire (e.g., `gemini-3-flash-preview` may not exist)
+
+3. **Verify fallback models too** - When implementing fallback logic, verify all model names in the fallback chain
+
+## Example Verification
+
+Before writing code like:
+```python
+DEFAULT_MODELS = {
+    "openai": "gpt-4o-mini",
+    "gemini": "gemini-2.5-flash",
+}
+```
+
+First search: "OpenAI current model names 2026" and "Gemini current model names 2026"
+
+## Common Mistakes to Avoid
+
+- Using `gemini-2.5-flash` when it may be deprecated
+- Using preview model names that have expired
+- Assuming model naming conventions without checking
+- Copying model names from old code examples
+
+## When in Doubt
+
+Ask the user: "Which specific model would you like to use? I can verify it exists in the current API."

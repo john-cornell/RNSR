@@ -588,7 +588,7 @@ Answer:"""
 # Evaluation Suite
 # =============================================================================
 
-@dataclass(kw_only=True)
+@dataclass
 class EvaluationConfig:
     """Configuration for benchmark evaluation."""
     

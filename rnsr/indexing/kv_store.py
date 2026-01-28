@@ -20,7 +20,7 @@ import hashlib
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Union
 
 import structlog
 
@@ -310,4 +310,4 @@ class InMemoryKVStore:
 
 
 # Type alias for either store
-KVStore = SQLiteKVStore | InMemoryKVStore
+KVStore = Union[SQLiteKVStore, InMemoryKVStore]

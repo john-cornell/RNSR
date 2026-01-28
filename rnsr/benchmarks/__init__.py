@@ -6,12 +6,18 @@ Measures:
 2. Quality: Retrieval accuracy, answer relevance (requires ground truth)
 3. Comparison: RNSR vs baseline chunking approaches
 4. Standard Benchmarks: HotpotQA, MuSiQue, BEIR, RAGAS
+5. Comprehensive: All navigator types (standard, RLM, vision, hybrid)
 
 Standard RAG Benchmarks:
 - HotpotQA: Multi-hop question answering (EMNLP 2018)
 - MuSiQue: Compositional multi-hop QA (TACL 2022)
 - BEIR: Information retrieval benchmark (NeurIPS 2021)
 - RAGAS: RAG evaluation metrics (faithfulness, relevance, etc.)
+
+Comprehensive Benchmark (PageIndex/RLM-inspired):
+- FinanceBench-style: Financial document QA
+- OOLONG-style: Long context aggregation
+- Multi-hop: Complex relational queries
 """
 
 from rnsr.benchmarks.performance import (
@@ -54,6 +60,19 @@ from rnsr.benchmarks.evaluation_suite import (
     EvaluationReport,
     RNSRBenchmarkAdapter,
 )
+from rnsr.benchmarks.comprehensive_benchmark import (
+    # Comprehensive benchmark for all navigator types
+    ComprehensiveBenchmarkRunner,
+    ComprehensiveBenchmarkReport,
+    BenchmarkTestCase,
+    MethodResults,
+    run_comprehensive_benchmark,
+    quick_benchmark,
+    # Standard test suites
+    get_financebench_cases,
+    get_oolong_style_cases,
+    get_multi_hop_cases,
+)
 
 __all__ = [
     # Performance
@@ -86,4 +105,14 @@ __all__ = [
     "EvaluationConfig",
     "EvaluationReport",
     "RNSRBenchmarkAdapter",
+    # Comprehensive Benchmark (State-of-the-Art)
+    "ComprehensiveBenchmarkRunner",
+    "ComprehensiveBenchmarkReport",
+    "BenchmarkTestCase",
+    "MethodResults",
+    "run_comprehensive_benchmark",
+    "quick_benchmark",
+    "get_financebench_cases",
+    "get_oolong_style_cases",
+    "get_multi_hop_cases",
 ]
