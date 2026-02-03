@@ -202,9 +202,9 @@ answer = run_rlm_navigator(
 
 | Provider | Models |
 |----------|--------|
-| **OpenAI** | `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo` |
+| **OpenAI** | `gpt-5.2`, `gpt-5.2-pro`, `gpt-5-mini` |
 | **Anthropic** | `claude-sonnet-4-5`, `claude-haiku-4-5`, `claude-opus-4-5` |
-| **Gemini** | `gemini-2.5-flash`, `gemini-2.5-pro` |
+| **Gemini** | `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3-flash-preview`, `gemini-3-pro-preview` |
 
 ## Benchmarks
 
