@@ -33,12 +33,16 @@ from pathlib import Path
 import structlog
 
 from rnsr.exceptions import IngestionError
+from rnsr.ingestion.document_boundary import (
+    DocumentBoundaryDetector,
+    segment_by_documents,
+)
 from rnsr.ingestion.font_histogram import FontHistogramAnalyzer
 from rnsr.ingestion.header_classifier import classify_headers
 from rnsr.ingestion.layout_detector import detect_layout_complexity
 from rnsr.ingestion.ocr_fallback import has_extractable_text, try_ocr_ingestion
 from rnsr.ingestion.semantic_fallback import try_semantic_splitter_ingestion
-from rnsr.ingestion.tree_builder import build_document_tree
+from rnsr.ingestion.tree_builder import build_document_tree, build_multi_document_tree
 from rnsr.models import DocumentTree, IngestionResult
 
 logger = structlog.get_logger(__name__)
@@ -192,9 +196,13 @@ def _try_tier_1(
     pdf_path: Path,
     warnings: list[str],
     stats: dict,
+    detect_multi_document: bool = True,
+    boundary_confidence: float = 0.5,
 ) -> IngestionResult | None:
     """
     TIER 1: Try Font Histogram ingestion.
+    
+    Now includes multi-document detection for combined PDFs.
     
     Returns None if should fall back to Tier 2.
     """
@@ -220,6 +228,47 @@ def _try_tier_1(
             warnings.append("No headers detected - using semantic splitter")
             return None  # Trigger Tier 2
         
+        # NEW: Detect document boundaries for multi-document PDFs
+        if detect_multi_document:
+            segments = segment_by_documents(
+                spans, 
+                min_confidence=boundary_confidence,
+            )
+            
+            stats["documents_detected"] = len(segments)
+            
+            if len(segments) > 1:
+                logger.info(
+                    "multi_document_detected",
+                    path=str(pdf_path),
+                    document_count=len(segments),
+                    titles=[s.title[:30] for s in segments],
+                )
+                
+                # Build multi-document tree
+                tree = build_multi_document_tree(
+                    segments,
+                    container_title=pdf_path.stem,
+                )
+                tree.ingestion_tier = 1
+                tree.ingestion_method = "font_histogram"
+                
+                logger.info(
+                    "tier_1_success",
+                    path=str(pdf_path),
+                    nodes=tree.total_nodes,
+                    documents=len(segments),
+                )
+                
+                return IngestionResult(
+                    tree=tree,
+                    tier_used=1,
+                    method="font_histogram",
+                    warnings=warnings,
+                    stats=stats,
+                )
+        
+        # Single document: standard processing
         # Classify spans
         classified = classify_headers(spans, analysis)
         

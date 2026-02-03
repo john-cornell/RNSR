@@ -78,4 +78,5 @@ docs/_build/
 site/
 
 # Test PDFs
-test_pdfs/
+test_pdfs/# Test documents (too large for GitHub)
+rnsr/test-documents/

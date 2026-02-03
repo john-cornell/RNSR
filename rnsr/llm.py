@@ -65,18 +65,18 @@ class LLMProvider(str, Enum):
     AUTO = "auto"  # Auto-detect from environment
 
 
-# Default models per provider (updated January 2026)
+# Default models per provider (updated February 2026)
 DEFAULT_MODELS = {
     LLMProvider.OPENAI: {
-        "llm": "gpt-4.1-mini",  # Fast, affordable - use "gpt-5-mini" for latest
+        "llm": "gpt-5-mini",  # Fast, affordable - use "gpt-5.2" for latest
         "embed": "text-embedding-3-small",
     },
     LLMProvider.ANTHROPIC: {
-        "llm": "claude-sonnet-4-5",  # Smart model for agents/coding
+        "llm": "claude-sonnet-4-5",  # Smart model for agents/coding (alias for claude-sonnet-4-5-20250929)
         "embed": None,  # Anthropic doesn't have embeddings, fall back to OpenAI/Gemini
     },
     LLMProvider.GEMINI: {
-        "llm": "gemini-2.5-flash",  # Best price-performance. Falls back to preview on overload.
+        "llm": "gemini-2.5-flash",  # Stable model. Use "gemini-3-flash-preview" for latest.
         "embed": "text-embedding-004",
     },
 }

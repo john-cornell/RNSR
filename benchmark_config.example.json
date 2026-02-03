@@ -22,7 +22,7 @@
   "output_dir": "benchmark_results",
   "llm_config": {
     "provider": "openai",
-    "model": "gpt-4.1-2025-04-14",
+    "model": "gpt-5-mini",
     "temperature": 0.0
   },
   "notes": "This is an example benchmark configuration. Update paths and test cases for your documents."

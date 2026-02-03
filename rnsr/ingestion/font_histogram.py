@@ -221,6 +221,59 @@ class FontHistogramAnalyzer:
         
         return analysis, spans
 
+    def analyze_spans(self, spans: list[SpanInfo]) -> FontAnalysis:
+        """
+        Perform font histogram analysis on pre-extracted spans.
+        
+        This is useful when spans have already been extracted and segmented
+        (e.g., for multi-document PDFs).
+        
+        Args:
+            spans: List of SpanInfo objects.
+            
+        Returns:
+            FontAnalysis result.
+        """
+        if not spans:
+            return FontAnalysis(
+                body_size=12.0,
+                header_threshold=14.0,
+                size_histogram={12.0: 1},
+                span_count=0,
+                unique_sizes=1,
+            )
+        
+        # Build frequency histogram of font sizes
+        sizes = [s.font_size for s in spans]
+        size_counts = Counter(sizes)
+        
+        # Identify Body Text (most frequent font size = mode)
+        try:
+            body_size = mode(sizes)
+        except Exception:
+            body_size = size_counts.most_common(1)[0][0]
+        
+        # Calculate header threshold
+        unique_sizes = len(set(sizes))
+        
+        if unique_sizes > 1 and len(sizes) > 2:
+            try:
+                threshold = stdev(sizes)
+            except Exception:
+                threshold = 2.0
+        else:
+            threshold = 2.0
+        
+        header_threshold = body_size + threshold
+        
+        return FontAnalysis(
+            body_size=body_size,
+            header_threshold=header_threshold,
+            size_histogram={float(k): v for k, v in size_counts.items()},
+            span_count=len(spans),
+            unique_sizes=unique_sizes,
+        )
+
     def has_font_variance(self, analysis: FontAnalysis) -> bool:
         """
         Check if the document has enough font variance for hierarchical extraction.

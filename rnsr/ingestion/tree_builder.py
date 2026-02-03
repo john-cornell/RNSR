@@ -11,15 +11,24 @@ The tree structure enables:
 - Hierarchical navigation by the agent
 - Section-based summarization
 - Context-aware retrieval
+
+Multi-Document Support:
+- Detects document boundaries in combined PDFs
+- Creates separate subtrees for each logical document
+- Preserves internal hierarchy within each document
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import structlog
 
 from rnsr.models import ClassifiedSpan, DocumentNode, DocumentTree
+
+if TYPE_CHECKING:
+    from rnsr.ingestion.document_boundary import DocumentSegment
 
 logger = structlog.get_logger(__name__)
 
@@ -233,6 +242,137 @@ def build_document_tree(
     """
     builder = TreeBuilder()
     return builder.build_tree(spans, title)
+
+
+def build_multi_document_tree(
+    segments: list[DocumentSegment],
+    container_title: str = "",
+) -> DocumentTree:
+    """
+    Build a tree from multiple document segments.
+    
+    Creates a structure where:
+    - Root node represents the container (e.g., the PDF file)
+    - Each document segment becomes a level-1 child
+    - Internal structure of each document is preserved below that
+    
+    Args:
+        segments: List of DocumentSegment from boundary detection
+        container_title: Title for the root container node
+        
+    Returns:
+        DocumentTree with multi-document structure
+    """
+    from rnsr.ingestion.header_classifier import classify_headers
+    from rnsr.ingestion.font_histogram import FontHistogramAnalyzer
+    
+    if not segments:
+        root = DocumentNode(id="root", level=0, header=container_title or "Documents")
+        return DocumentTree(
+            title=container_title or "Documents",
+            root=root,
+            total_nodes=1,
+        )
+    
+    # If only one segment, build a regular tree
+    if len(segments) == 1:
+        builder = TreeBuilder()
+        # Need to classify spans first
+        analyzer = FontHistogramAnalyzer()
+        analysis = analyzer.analyze_spans(segments[0].spans)
+        classified = classify_headers(segments[0].spans, analysis)
+        return builder.build_tree(classified, segments[0].title or container_title)
+    
+    # Create container root node
+    root = DocumentNode(
+        id="root",
+        level=0,
+        header=container_title or f"{len(segments)} Documents",
+    )
+    
+    total_nodes = 1
+    builder = TreeBuilder()
+    analyzer = FontHistogramAnalyzer()
+    
+    for i, segment in enumerate(segments):
+        # Create a document node for this segment
+        doc_title = segment.title or f"Document {i + 1}"
+        
+        logger.debug(
+            "building_document_subtree",
+            doc_index=i,
+            title=doc_title[:50],
+            span_count=len(segment.spans),
+            pages=f"{segment.start_page}-{segment.end_page}",
+        )
+        
+        # Analyze and classify spans for this segment
+        if segment.spans:
+            analysis = analyzer.analyze_spans(segment.spans)
+            classified = classify_headers(segment.spans, analysis)
+            
+            # Build subtree for this document
+            subtree = builder.build_tree(classified, doc_title)
+            
+            # The subtree's root becomes a child of our container root
+            # But we need to shift levels down by 1
+            # Pass doc_index to generate unique IDs and avoid collision with container root
+            doc_node = _shift_node_levels(subtree.root, level_shift=1, doc_index=i)
+            doc_node.header = doc_title  # Ensure title is preserved
+            
+            root.children.append(doc_node)
+            total_nodes += subtree.total_nodes
+        else:
+            # Empty segment - just create a placeholder
+            doc_node = DocumentNode(
+                id=f"doc_{i:03d}",
+                level=1,
+                header=doc_title,
+                page_num=segment.start_page,
+            )
+            root.children.append(doc_node)
+            total_nodes += 1
+    
+    logger.info(
+        "multi_document_tree_built",
+        documents=len(segments),
+        total_nodes=total_nodes,
+    )
+    
+    return DocumentTree(
+        title=container_title or f"{len(segments)} Documents",
+        root=root,
+        total_nodes=total_nodes,
+    )
+
+
+def _shift_node_levels(node: DocumentNode, level_shift: int, doc_index: int = 0) -> DocumentNode:
+    """
+    Recursively shift all node levels by a fixed amount.
+    
+    Used when embedding a subtree under a higher-level node.
+    Generates new unique IDs to avoid collisions with the container root.
+    """
+    # Generate new unique ID to avoid collision with container root
+    if node.id == "root":
+        new_id = f"doc_{doc_index:03d}"
+    else:
+        new_id = f"d{doc_index}_{node.id}"
+    
+    new_node = DocumentNode(
+        id=new_id,
+        level=node.level + level_shift,
+        header=node.header,
+        content=node.content,
+        page_num=node.page_num,
+        bbox=node.bbox,
+        children=[],
+    )
+    
+    for child in node.children:
+        new_node.children.append(_shift_node_levels(child, level_shift, doc_index))
+    
+    return new_node
 
 
 def tree_to_dict(tree: DocumentTree) -> dict:

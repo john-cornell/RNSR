@@ -167,7 +167,7 @@ def _get_llm_for_summary(provider: str | None = None) -> Any:
             from llama_index.llms.openai import OpenAI
             
             logger.info("using_openai_llm")
-            return OpenAI(model="gpt-4.1-mini")
+            return OpenAI(model="gpt-5-mini")
         
         else:
             logger.warning("unknown_llm_provider", provider=provider)
