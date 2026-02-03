@@ -383,9 +383,9 @@ record = tracker.create_provenance_record(answer, question, variables)
 
 | Provider | Models |
 |----------|--------|
-| **OpenAI** | `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo` |
-| **Anthropic** | `claude-sonnet-4-5`, `claude-haiku-4-5`, `claude-opus-4-5` |
-| **Gemini** | `gemini-2.0-flash`, `gemini-2.0-pro`, `gemini-1.5-pro` |
+| **OpenAI** | `gpt-5.2`, `gpt-5-mini`, `gpt-5-nano`, `gpt-4.1`, `gpt-4o-mini` |
+| **Anthropic** | `claude-opus-4-5`, `claude-sonnet-4-5`, `claude-haiku-4-5` |
+| **Gemini** | `gemini-3-pro-preview`, `gemini-3-flash-preview`, `gemini-2.5-pro`, `gemini-2.5-flash` |
 
 ## Benchmarks
 
