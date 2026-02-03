@@ -616,6 +616,8 @@ def extract_entities_from_tree(
     tree: DocumentTree,
     doc_id: str | None = None,
     extract_relationships: bool = True,
+    max_nodes: int = 100,
+    sample_strategy: str = "important",
 ) -> dict:
     """
     Extract entities and relationships from an ingested document tree.
@@ -630,6 +632,9 @@ def extract_entities_from_tree(
         tree: The ingested DocumentTree.
         doc_id: Document ID (defaults to tree.id).
         extract_relationships: Whether to also extract relationships.
+        max_nodes: Maximum nodes to process (for large documents).
+        sample_strategy: How to select nodes - "important" (headers first), 
+                        "uniform" (evenly spaced), or "all" (process all).
         
     Returns:
         Dictionary containing:
@@ -663,30 +668,66 @@ def extract_entities_from_tree(
     all_relationships = []
     
     # Collect all nodes for processing
-    nodes_to_process = _collect_nodes(tree.root, doc_id)
+    all_nodes = _collect_nodes(tree.root, doc_id)
+    
+    # Sample nodes if too many
+    if sample_strategy != "all" and len(all_nodes) > max_nodes:
+        nodes_to_process = _sample_nodes(all_nodes, max_nodes, sample_strategy)
+        logger.info(
+            "entity_extraction_sampling",
+            total_nodes=len(all_nodes),
+            sampled_nodes=len(nodes_to_process),
+            strategy=sample_strategy,
+        )
+    else:
+        nodes_to_process = all_nodes
     
     logger.info(
         "entity_extraction_started",
         doc_id=doc_id,
         node_count=len(nodes_to_process),
+        total_nodes=len(all_nodes),
         extractor="RLMUnifiedExtractor",
     )
     
-    # Extract entities AND relationships from each node
-    for node_data in nodes_to_process:
-        result = extractor.extract(
-            node_id=node_data["node_id"],
-            doc_id=doc_id,
-            header=node_data["header"],
-            content=node_data["content"],
-            page_num=node_data.get("page_num"),
-        )
+    # Process nodes in batches for efficiency
+    batch_size = 10
+    processed = 0
+    
+    for i in range(0, len(nodes_to_process), batch_size):
+        batch = nodes_to_process[i:i + batch_size]
         
-        if result.entities:
-            all_entities.extend(result.entities)
+        for node_data in batch:
+            try:
+                result = extractor.extract(
+                    node_id=node_data["node_id"],
+                    doc_id=doc_id,
+                    header=node_data["header"],
+                    content=node_data["content"],
+                    page_num=node_data.get("page_num"),
+                )
+                
+                if result.entities:
+                    all_entities.extend(result.entities)
+                
+                if extract_relationships and result.relationships:
+                    all_relationships.extend(result.relationships)
+                    
+            except Exception as e:
+                logger.warning(
+                    "node_extraction_failed",
+                    node_id=node_data.get("node_id"),
+                    error=str(e)[:100],
+                )
         
-        if extract_relationships and result.relationships:
-            all_relationships.extend(result.relationships)
+        processed += len(batch)
+        if processed % 20 == 0:
+            logger.info(
+                "entity_extraction_progress",
+                processed=processed,
+                total=len(nodes_to_process),
+                entities_so_far=len(all_entities),
+            )
     
     # Merge duplicate entities
     merged_entities = merge_entities(all_entities)
@@ -743,6 +784,59 @@ def _collect_nodes(node, doc_id: str, collected: list | None = None) -> list[dic
         _collect_nodes(child, doc_id, collected)
     
     return collected
+
+
+def _sample_nodes(nodes: list[dict], max_nodes: int, strategy: str) -> list[dict]:
+    """
+    Sample nodes from a large document for efficient processing.
+    
+    Args:
+        nodes: All collected nodes.
+        max_nodes: Maximum number of nodes to return.
+        strategy: Sampling strategy - "important", "uniform", or "first".
+        
+    Returns:
+        Sampled list of nodes.
+    """
+    if len(nodes) <= max_nodes:
+        return nodes
+    
+    if strategy == "important":
+        # Prioritize nodes with headers and higher-level sections
+        scored_nodes = []
+        for node in nodes:
+            score = 0
+            
+            # Prefer nodes with headers
+            if node.get("header"):
+                score += 10
+            
+            # Prefer higher-level (lower number) sections
+            level = node.get("level", 3)
+            score += max(0, 5 - level)
+            
+            # Prefer nodes with substantial content
+            content_len = len(node.get("content", ""))
+            if content_len > 500:
+                score += 3
+            elif content_len > 200:
+                score += 2
+            elif content_len > 50:
+                score += 1
+            
+            scored_nodes.append((score, node))
+        
+        # Sort by score (descending) and take top nodes
+        scored_nodes.sort(key=lambda x: x[0], reverse=True)
+        return [node for _, node in scored_nodes[:max_nodes]]
+    
+    elif strategy == "uniform":
+        # Evenly sample across the document
+        step = len(nodes) // max_nodes
+        return [nodes[i] for i in range(0, len(nodes), step)][:max_nodes]
+    
+    else:  # "first"
+        return nodes[:max_nodes]
 
 
 def _count_entity_types(entities: list) -> dict[str, int]:

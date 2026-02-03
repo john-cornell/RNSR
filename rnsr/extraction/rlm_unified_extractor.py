@@ -585,15 +585,40 @@ class RLMUnifiedExtractor:
                 response = llm.complete(prompt)
                 code = str(response) if not isinstance(response, str) else response
                 
+                # Validate we got actual code
+                if not code or len(code.strip()) < 20:
+                    logger.warning("empty_or_short_code_response", attempt=attempt, length=len(code) if code else 0)
+                    continue
+                
+                # Check if response looks like code (not just JSON or text)
+                if "store_variable" not in code and "entities" not in code.lower():
+                    logger.warning("response_not_code", attempt=attempt, preview=code[:100])
+                    prompt += "\n\nPlease respond ONLY with Python code that extracts entities and relationships."
+                    continue
+                
                 # Execute
                 exec_result = repl.execute(code)
                 
                 if exec_result["success"]:
+                    entities = exec_result.get("entities", [])
+                    relationships = exec_result.get("relationships", [])
+                    
+                    # Validate entities are properly structured
+                    valid_entities = []
+                    for e in entities:
+                        if isinstance(e, dict) and e.get("text"):
+                            valid_entities.append(e)
+                    
+                    valid_relationships = []
+                    for r in relationships:
+                        if isinstance(r, dict) and (r.get("source_text") or r.get("type")):
+                            valid_relationships.append(r)
+                    
                     return {
                         "success": True,
                         "code": code,
-                        "entities": exec_result.get("entities", []),
-                        "relationships": exec_result.get("relationships", []),
+                        "entities": valid_entities,
+                        "relationships": valid_relationships,
                     }
                 else:
                     # Retry with error feedback
@@ -634,12 +659,41 @@ class RLMUnifiedExtractor:
             response = llm.complete(prompt)
             response_text = str(response) if not isinstance(response, str) else response
             
-            # Parse JSON
-            json_match = re.search(r'\{[\s\S]*\}', response_text)
-            if not json_match:
-                return {"entities": entities, "relationships": relationships}
+            # Clean response - remove markdown code blocks if present
+            response_text = re.sub(r'^```json\s*', '', response_text, flags=re.MULTILINE)
+            response_text = re.sub(r'^```\s*$', '', response_text, flags=re.MULTILINE)
+            response_text = response_text.strip()
             
-            data = json.loads(json_match.group())
+            # Parse JSON - try multiple strategies
+            data = None
+            
+            # Strategy 1: Direct parse
+            try:
+                data = json.loads(response_text)
+            except json.JSONDecodeError:
+                pass
+            
+            # Strategy 2: Extract JSON object
+            if data is None:
+                json_match = re.search(r'\{[\s\S]*\}', response_text)
+                if json_match:
+                    try:
+                        data = json.loads(json_match.group())
+                    except json.JSONDecodeError:
+                        pass
+            
+            # Strategy 3: Try to fix common issues
+            if data is None:
+                # Try fixing trailing commas, missing quotes, etc.
+                fixed = re.sub(r',(\s*[}\]])', r'\1', response_text)
+                try:
+                    data = json.loads(fixed)
+                except json.JSONDecodeError:
+                    pass
+            
+            if data is None:
+                logger.debug("tot_json_parse_failed", response_preview=response_text[:200])
+                return {"entities": entities, "relationships": relationships}
             
             # Apply validations
             entity_validations = {v["id"]: v for v in data.get("entity_validations", [])}
