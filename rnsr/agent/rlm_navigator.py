@@ -10,6 +10,7 @@ Key Features:
 3. Deep recursive sub-LLM calls (configurable depth)
 4. Answer verification loops
 5. Async parallel sub-LLM processing
+6. Adaptive learning for stop words and query patterns
 
 This is the state-of-the-art combination of:
 - PageIndex: Vectorless, reasoning-based tree search
@@ -20,10 +21,14 @@ This is the state-of-the-art combination of:
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, Literal
 
 import structlog
@@ -33,6 +38,534 @@ from rnsr.indexing.kv_store import KVStore
 from rnsr.models import SkeletonNode, TraceEntry
 
 logger = structlog.get_logger(__name__)
+
+
+# =============================================================================
+# Learned Stop Words Registry
+# =============================================================================
+
+DEFAULT_STOP_WORDS_PATH = Path.home() / ".rnsr" / "learned_stop_words.json"
+
+
+class LearnedStopWords:
+    """
+    Registry for learning domain-specific stop words.
+    
+    Learns:
+    - Words that are generic in your domain (should be filtered)
+    - Words that seem generic but are important in your domain (should be kept)
+    
+    Examples:
+    - Legal: "hereby", "whereas" are filler (add to stop)
+    - Legal: "party" is important (remove from stop)
+    """
+    
+    # Base stop words (always included unless explicitly removed)
+    BASE_STOP_WORDS = {
+        "what", "is", "the", "a", "an", "are", "was", "were", "be", "been",
+        "being", "have", "has", "had", "do", "does", "did", "will", "would",
+        "could", "should", "may", "might", "must", "shall", "can", "need",
+        "dare", "ought", "used", "to", "of", "in", "for", "on", "with", "at",
+        "by", "from", "about", "into", "through", "during", "before", "after",
+        "above", "below", "between", "under", "again", "further", "then",
+        "once", "here", "there", "when", "where", "why", "how", "all", "each",
+        "few", "more", "most", "other", "some", "such", "no", "nor", "not",
+        "only", "own", "same", "so", "than", "too", "very", "just", "and",
+        "but", "if", "or", "because", "as", "until", "while", "this", "that",
+        "these", "those", "find", "show", "list", "describe", "explain", "tell",
+    }
+    
+    def __init__(
+        self,
+        storage_path: Path | str | None = None,
+        auto_save: bool = True,
+    ):
+        """
+        Initialize the learned stop words registry.
+        
+        Args:
+            storage_path: Path to JSON file for persistence.
+            auto_save: Whether to save after changes.
+        """
+        self.storage_path = Path(storage_path) if storage_path else DEFAULT_STOP_WORDS_PATH
+        self.auto_save = auto_save
+        
+        self._lock = Lock()
+        self._added_stop_words: dict[str, dict[str, Any]] = {}  # Domain-specific additions
+        self._removed_stop_words: dict[str, dict[str, Any]] = {}  # Words to keep despite being in base
+        self._dirty = False
+        
+        self._load()
+    
+    def _load(self) -> None:
+        """Load learned stop words from storage."""
+        if not self.storage_path.exists():
+            return
+        
+        try:
+            with open(self.storage_path, "r") as f:
+                data = json.load(f)
+            
+            self._added_stop_words = data.get("added", {})
+            self._removed_stop_words = data.get("removed", {})
+            
+            logger.info(
+                "learned_stop_words_loaded",
+                added=len(self._added_stop_words),
+                removed=len(self._removed_stop_words),
+            )
+            
+        except Exception as e:
+            logger.warning("failed_to_load_stop_words", error=str(e))
+    
+    def _save(self) -> None:
+        """Save to storage."""
+        if not self._dirty:
+            return
+        
+        try:
+            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            data = {
+                "version": "1.0",
+                "updated_at": datetime.utcnow().isoformat(),
+                "added": self._added_stop_words,
+                "removed": self._removed_stop_words,
+            }
+            
+            with open(self.storage_path, "w") as f:
+                json.dump(data, f, indent=2)
+            
+            self._dirty = False
+            
+        except Exception as e:
+            logger.warning("failed_to_save_stop_words", error=str(e))
+    
+    def add_stop_word(
+        self,
+        word: str,
+        domain: str = "general",
+        reason: str = "",
+    ) -> None:
+        """
+        Add a word to the stop word list.
+        
+        Args:
+            word: Word to add.
+            domain: Domain category.
+            reason: Why this should be a stop word.
+        """
+        word = word.lower().strip()
+        
+        if not word or word in self.BASE_STOP_WORDS:
+            return
+        
+        with self._lock:
+            now = datetime.utcnow().isoformat()
+            
+            if word not in self._added_stop_words:
+                self._added_stop_words[word] = {
+                    "count": 0,
+                    "domain": domain,
+                    "reason": reason,
+                    "first_seen": now,
+                    "last_seen": now,
+                }
+                logger.info("stop_word_added", word=word)
+            
+            self._added_stop_words[word]["count"] += 1
+            self._added_stop_words[word]["last_seen"] = now
+            
+            self._dirty = True
+            
+            if self.auto_save:
+                self._save()
+    
+    def remove_stop_word(
+        self,
+        word: str,
+        domain: str = "general",
+        reason: str = "",
+    ) -> None:
+        """
+        Mark a base stop word as important (should not be filtered).
+        
+        Args:
+            word: Word to keep.
+            domain: Domain where this is important.
+            reason: Why this should be kept.
+        """
+        word = word.lower().strip()
+        
+        if not word or word not in self.BASE_STOP_WORDS:
+            return
+        
+        with self._lock:
+            now = datetime.utcnow().isoformat()
+            
+            if word not in self._removed_stop_words:
+                self._removed_stop_words[word] = {
+                    "count": 0,
+                    "domain": domain,
+                    "reason": reason,
+                    "first_seen": now,
+                    "last_seen": now,
+                }
+                logger.info("stop_word_marked_important", word=word)
+            
+            self._removed_stop_words[word]["count"] += 1
+            self._removed_stop_words[word]["last_seen"] = now
+            
+            self._dirty = True
+            
+            if self.auto_save:
+                self._save()
+    
+    def get_stop_words(self, min_count: int = 1) -> set[str]:
+        """
+        Get the effective stop word set.
+        
+        Returns:
+            Set of words to filter (base + added - removed).
+        """
+        with self._lock:
+            # Start with base
+            result = set(self.BASE_STOP_WORDS)
+            
+            # Add learned additions
+            for word, data in self._added_stop_words.items():
+                if data["count"] >= min_count:
+                    result.add(word)
+            
+            # Remove marked-important words
+            for word, data in self._removed_stop_words.items():
+                if data["count"] >= min_count:
+                    result.discard(word)
+            
+            return result
+    
+    def get_stats(self) -> dict[str, Any]:
+        """Get statistics about stop words."""
+        return {
+            "base_count": len(self.BASE_STOP_WORDS),
+            "added_count": len(self._added_stop_words),
+            "removed_count": len(self._removed_stop_words),
+            "effective_count": len(self.get_stop_words()),
+        }
+
+
+# Global stop words registry
+_global_stop_words: LearnedStopWords | None = None
+
+
+def get_learned_stop_words() -> LearnedStopWords:
+    """Get the global learned stop words registry."""
+    global _global_stop_words
+    
+    if _global_stop_words is None:
+        custom_path = os.getenv("RNSR_STOP_WORDS_PATH")
+        _global_stop_words = LearnedStopWords(
+            storage_path=custom_path if custom_path else None
+        )
+    
+    return _global_stop_words
+
+
+# =============================================================================
+# Learned Query Patterns Registry
+# =============================================================================
+
+DEFAULT_QUERY_PATTERNS_PATH = Path.home() / ".rnsr" / "learned_query_patterns.json"
+
+
+class LearnedQueryPatterns:
+    """
+    Registry for learning successful query patterns.
+    
+    Tracks:
+    - Query patterns that lead to high-confidence answers
+    - Patterns that need decomposition vs. direct retrieval
+    - Entity-focused vs. section-focused queries
+    
+    Used to:
+    - Inform decomposition strategy
+    - Adjust confidence thresholds
+    - Route to specialized handlers
+    """
+    
+    def __init__(
+        self,
+        storage_path: Path | str | None = None,
+        auto_save: bool = True,
+    ):
+        """
+        Initialize the query patterns registry.
+        
+        Args:
+            storage_path: Path to JSON file for persistence.
+            auto_save: Whether to save after changes.
+        """
+        self.storage_path = Path(storage_path) if storage_path else DEFAULT_QUERY_PATTERNS_PATH
+        self.auto_save = auto_save
+        
+        self._lock = Lock()
+        self._patterns: dict[str, dict[str, Any]] = {}
+        self._dirty = False
+        
+        self._load()
+    
+    def _load(self) -> None:
+        """Load learned patterns from storage."""
+        if not self.storage_path.exists():
+            return
+        
+        try:
+            with open(self.storage_path, "r") as f:
+                data = json.load(f)
+            
+            self._patterns = data.get("patterns", {})
+            
+            logger.info(
+                "query_patterns_loaded",
+                patterns=len(self._patterns),
+            )
+            
+        except Exception as e:
+            logger.warning("failed_to_load_query_patterns", error=str(e))
+    
+    def _save(self) -> None:
+        """Save to storage."""
+        if not self._dirty:
+            return
+        
+        try:
+            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            data = {
+                "version": "1.0",
+                "updated_at": datetime.utcnow().isoformat(),
+                "patterns": self._patterns,
+            }
+            
+            with open(self.storage_path, "w") as f:
+                json.dump(data, f, indent=2)
+            
+            self._dirty = False
+            
+        except Exception as e:
+            logger.warning("failed_to_save_query_patterns", error=str(e))
+    
+    def record_query(
+        self,
+        query: str,
+        pattern_type: str,
+        success: bool,
+        confidence: float,
+        needed_decomposition: bool,
+        sub_questions_count: int = 0,
+        entities_involved: list[str] | None = None,
+    ) -> None:
+        """
+        Record a query and its outcome.
+        
+        Args:
+            query: The original query.
+            pattern_type: Detected pattern type (entity_lookup, comparison, etc.)
+            success: Whether the query was answered successfully.
+            confidence: Answer confidence score.
+            needed_decomposition: Whether decomposition was required.
+            sub_questions_count: Number of sub-questions generated.
+            entities_involved: Entity types involved in the query.
+        """
+        pattern_type = pattern_type.lower().strip()
+        
+        with self._lock:
+            now = datetime.utcnow().isoformat()
+            
+            if pattern_type not in self._patterns:
+                self._patterns[pattern_type] = {
+                    "total_queries": 0,
+                    "successful_queries": 0,
+                    "total_confidence": 0.0,
+                    "decomposition_count": 0,
+                    "total_sub_questions": 0,
+                    "entity_types": {},
+                    "first_seen": now,
+                    "last_seen": now,
+                    "example_queries": [],
+                }
+                logger.info("new_query_pattern_discovered", pattern_type=pattern_type)
+            
+            pt = self._patterns[pattern_type]
+            pt["total_queries"] += 1
+            pt["total_confidence"] += confidence
+            pt["last_seen"] = now
+            
+            if success:
+                pt["successful_queries"] += 1
+            
+            if needed_decomposition:
+                pt["decomposition_count"] += 1
+                pt["total_sub_questions"] += sub_questions_count
+            
+            if entities_involved:
+                for entity_type in entities_involved:
+                    pt["entity_types"][entity_type] = pt["entity_types"].get(entity_type, 0) + 1
+            
+            if len(pt["example_queries"]) < 5:
+                pt["example_queries"].append({
+                    "query": query[:200],
+                    "success": success,
+                    "confidence": confidence,
+                    "timestamp": now,
+                })
+            
+            self._dirty = True
+            
+            if self.auto_save:
+                self._save()
+    
+    def detect_pattern_type(self, query: str) -> str:
+        """
+        Detect the pattern type of a query.
+        
+        Args:
+            query: The query to analyze.
+            
+        Returns:
+            Detected pattern type.
+        """
+        query_lower = query.lower()
+        
+        # Pattern detection heuristics
+        if any(word in query_lower for word in ["compare", "difference", "versus", "vs"]):
+            return "comparison"
+        
+        if any(word in query_lower for word in ["list", "all", "every", "enumerate"]):
+            return "enumeration"
+        
+        if any(word in query_lower for word in ["when", "date", "time", "timeline"]):
+            return "temporal"
+        
+        if any(word in query_lower for word in ["who", "person", "name"]):
+            return "entity_person"
+        
+        if any(word in query_lower for word in ["company", "organization", "entity"]):
+            return "entity_organization"
+        
+        if any(word in query_lower for word in ["how much", "amount", "price", "cost", "$"]):
+            return "monetary"
+        
+        if any(word in query_lower for word in ["section", "clause", "paragraph", "article"]):
+            return "section_lookup"
+        
+        if any(word in query_lower for word in ["what is", "define", "explain", "describe"]):
+            return "definition"
+        
+        if any(word in query_lower for word in ["why", "reason", "cause"]):
+            return "causal"
+        
+        return "general"
+    
+    def get_pattern_stats(self, pattern_type: str) -> dict[str, Any] | None:
+        """
+        Get statistics for a pattern type.
+        
+        Args:
+            pattern_type: The pattern type to look up.
+            
+        Returns:
+            Pattern statistics or None if not found.
+        """
+        pattern_type = pattern_type.lower().strip()
+        
+        with self._lock:
+            if pattern_type not in self._patterns:
+                return None
+            
+            pt = self._patterns[pattern_type]
+            total = pt["total_queries"]
+            
+            return {
+                "pattern_type": pattern_type,
+                "total_queries": total,
+                "success_rate": pt["successful_queries"] / total if total > 0 else 0,
+                "avg_confidence": pt["total_confidence"] / total if total > 0 else 0,
+                "decomposition_rate": pt["decomposition_count"] / total if total > 0 else 0,
+                "avg_sub_questions": pt["total_sub_questions"] / pt["decomposition_count"] if pt["decomposition_count"] > 0 else 0,
+                "top_entity_types": sorted(
+                    pt["entity_types"].items(),
+                    key=lambda x: -x[1]
+                )[:5],
+            }
+    
+    def should_decompose(self, pattern_type: str) -> bool:
+        """
+        Determine if a pattern type typically needs decomposition.
+        
+        Args:
+            pattern_type: The pattern type.
+            
+        Returns:
+            True if decomposition is recommended.
+        """
+        stats = self.get_pattern_stats(pattern_type)
+        
+        if not stats:
+            # Default recommendations for unknown patterns
+            always_decompose = {"comparison", "enumeration", "temporal"}
+            return pattern_type.lower() in always_decompose
+        
+        # Recommend decomposition if historically needed > 50% of the time
+        return stats["decomposition_rate"] > 0.5
+    
+    def get_confidence_threshold(self, pattern_type: str) -> float:
+        """
+        Get recommended confidence threshold for a pattern type.
+        
+        Args:
+            pattern_type: The pattern type.
+            
+        Returns:
+            Recommended confidence threshold.
+        """
+        stats = self.get_pattern_stats(pattern_type)
+        
+        if not stats or stats["total_queries"] < 5:
+            return 0.7  # Default threshold
+        
+        # Use average confidence minus one standard deviation as threshold
+        avg_conf = stats["avg_confidence"]
+        return max(0.5, min(0.9, avg_conf - 0.1))
+    
+    def get_all_patterns(self) -> list[dict[str, Any]]:
+        """Get statistics for all known patterns."""
+        results = []
+        
+        with self._lock:
+            for pattern_type in self._patterns:
+                stats = self.get_pattern_stats(pattern_type)
+                if stats:
+                    results.append(stats)
+        
+        return sorted(results, key=lambda x: -x["total_queries"])
+
+
+# Global query patterns registry
+_global_query_patterns: LearnedQueryPatterns | None = None
+
+
+def get_learned_query_patterns() -> LearnedQueryPatterns:
+    """Get the global learned query patterns registry."""
+    global _global_query_patterns
+    
+    if _global_query_patterns is None:
+        custom_path = os.getenv("RNSR_QUERY_PATTERNS_PATH")
+        _global_query_patterns = LearnedQueryPatterns(
+            storage_path=custom_path if custom_path else None
+        )
+    
+    return _global_query_patterns
 
 
 # =============================================================================
@@ -86,6 +619,8 @@ class PreFilterEngine:
     Implements the key RLM insight: use code (regex, keywords) to filter
     before sending to LLM. This dramatically reduces LLM calls.
     
+    Uses adaptive stop words that learn from domain-specific usage.
+    
     Example:
         # Query: "What is the liability clause?"
         # Instead of evaluating all 50 children with LLM:
@@ -94,29 +629,21 @@ class PreFilterEngine:
         # 3. Only send matching children to ToT evaluation
     """
     
-    def __init__(self, config: RLMConfig):
+    def __init__(self, config: RLMConfig, enable_stop_word_learning: bool = True):
         self.config = config
         self._keyword_cache: dict[str, list[str]] = {}
+        self._stop_word_registry = get_learned_stop_words() if enable_stop_word_learning else None
     
     def extract_keywords(self, query: str) -> list[str]:
         """Extract searchable keywords from a query."""
         if query in self._keyword_cache:
             return self._keyword_cache[query]
         
-        # Remove stop words and extract content words
-        stop_words = {
-            "what", "is", "the", "a", "an", "are", "was", "were", "be", "been",
-            "being", "have", "has", "had", "do", "does", "did", "will", "would",
-            "could", "should", "may", "might", "must", "shall", "can", "need",
-            "dare", "ought", "used", "to", "of", "in", "for", "on", "with", "at",
-            "by", "from", "about", "into", "through", "during", "before", "after",
-            "above", "below", "between", "under", "again", "further", "then",
-            "once", "here", "there", "when", "where", "why", "how", "all", "each",
-            "few", "more", "most", "other", "some", "such", "no", "nor", "not",
-            "only", "own", "same", "so", "than", "too", "very", "just", "and",
-            "but", "if", "or", "because", "as", "until", "while", "this", "that",
-            "these", "those", "find", "show", "list", "describe", "explain", "tell",
-        }
+        # Get stop words (base + learned)
+        if self._stop_word_registry:
+            stop_words = self._stop_word_registry.get_stop_words()
+        else:
+            stop_words = LearnedStopWords.BASE_STOP_WORDS
         
         # Tokenize and filter
         words = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
@@ -635,6 +1162,7 @@ class RLMNavigator:
     1. PageIndex-style tree search with reasoning
     2. RLM-style REPL environment with code execution
     3. RNSR-style variable stitching and skeleton indexing
+    4. Entity-aware query decomposition (when knowledge graph available)
     
     This is the unified, state-of-the-art document retrieval agent.
     """
@@ -644,16 +1172,19 @@ class RLMNavigator:
         skeleton: dict[str, SkeletonNode],
         kv_store: KVStore,
         config: RLMConfig | None = None,
+        knowledge_graph=None,
     ):
         self.skeleton = skeleton
         self.kv_store = kv_store
         self.config = config or RLMConfig()
+        self.knowledge_graph = knowledge_graph
         
         # Initialize components
         self.variable_store = VariableStore()
         self.pre_filter = PreFilterEngine(self.config)
         self.recursive_engine = RecursiveSubLLMEngine(self.config)
         self.verification_engine = AnswerVerificationEngine(self.config)
+        self.entity_decomposer = EntityAwareDecomposer(knowledge_graph)
         
         # LLM function
         self._llm_fn: Callable[[str], str] | None = None
@@ -673,6 +1204,12 @@ class RLMNavigator:
         self._llm_fn = llm_fn
         self.recursive_engine.set_llm_function(llm_fn)
         self.verification_engine.set_llm_function(llm_fn)
+        self.entity_decomposer.set_llm_function(llm_fn)
+    
+    def set_knowledge_graph(self, kg) -> None:
+        """Set the knowledge graph for entity-aware decomposition."""
+        self.knowledge_graph = kg
+        self.entity_decomposer.set_knowledge_graph(kg)
     
     def navigate(
         self,
@@ -777,7 +1314,7 @@ class RLMNavigator:
         return state
     
     def _phase_decompose(self, state: RLMAgentState) -> RLMAgentState:
-        """Phase 2: Decompose query into sub-questions."""
+        """Phase 2: Decompose query into sub-questions with entity awareness."""
         state.add_trace("decomposition", "Analyzing query for decomposition")
         
         if self._llm_fn is None:
@@ -785,7 +1322,47 @@ class RLMNavigator:
             state.pending_questions = [state.question]
             return state
         
-        # Use LLM to decompose
+        # Try entity-aware decomposition first if knowledge graph is available
+        if self.knowledge_graph:
+            try:
+                entity_result = self.entity_decomposer.decompose_with_entities(
+                    state.question
+                )
+                
+                if entity_result.get("entities_found"):
+                    # Store entity information in state
+                    state.metadata["entities_found"] = entity_result.get("entities_found", [])
+                    state.metadata["entity_nodes"] = entity_result.get("entity_nodes", {})
+                    state.metadata["retrieval_plan"] = entity_result.get("retrieval_plan", [])
+                    state.metadata["relationships"] = entity_result.get("relationships", [])
+                    
+                    sub_tasks = entity_result.get("sub_queries", [state.question])
+                    state.sub_questions = sub_tasks
+                    state.pending_questions = sub_tasks.copy()
+                    state.current_sub_question = sub_tasks[0] if sub_tasks else state.question
+                    
+                    # Prioritize nodes from retrieval plan in pre-filtering
+                    for item in entity_result.get("retrieval_plan", []):
+                        node_id = item.get("node_id")
+                        if node_id and node_id not in state.pre_filtered_nodes:
+                            state.pre_filtered_nodes[node_id] = ["entity_match"]
+                    
+                    state.add_trace(
+                        "decomposition",
+                        f"Entity-aware decomposition: {len(sub_tasks)} sub-tasks, {len(entity_result.get('entities_found', []))} entities",
+                        {
+                            "sub_tasks": sub_tasks,
+                            "entities": [e.canonical_name for e in entity_result.get("entities_found", [])],
+                        },
+                    )
+                    
+                    return state
+                    
+            except Exception as e:
+                logger.debug("entity_aware_decomposition_failed", error=str(e))
+                # Fall through to standard decomposition
+        
+        # Standard LLM decomposition
         decomposition_prompt = f"""Analyze this query and decompose it into specific sub-tasks.
 
 Query: {state.question}
@@ -1178,6 +1755,276 @@ Answer:"""
 
 
 # =============================================================================
+# Entity-Aware Query Decomposition
+# =============================================================================
+
+
+class EntityAwareDecomposer:
+    """
+    Enhances query decomposition by leveraging entity relationships
+    from the knowledge graph.
+    
+    This allows the navigator to:
+    1. Identify entities mentioned in the query
+    2. Look up related entities via the knowledge graph
+    3. Plan retrieval based on entity relationships
+    4. Generate entity-focused sub-queries
+    """
+    
+    def __init__(
+        self,
+        knowledge_graph=None,
+        llm_fn: Callable[[str], str] | None = None,
+    ):
+        """
+        Initialize the entity-aware decomposer.
+        
+        Args:
+            knowledge_graph: Optional knowledge graph for entity lookup.
+            llm_fn: LLM function for query analysis.
+        """
+        self.kg = knowledge_graph
+        self._llm_fn = llm_fn
+    
+    def set_llm_function(self, llm_fn: Callable[[str], str]) -> None:
+        """Set the LLM function."""
+        self._llm_fn = llm_fn
+    
+    def set_knowledge_graph(self, kg) -> None:
+        """Set the knowledge graph."""
+        self.kg = kg
+    
+    def decompose_with_entities(
+        self,
+        query: str,
+        doc_id: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Decompose a query using entity awareness.
+        
+        Args:
+            query: The user's query.
+            doc_id: Optional document ID to scope entity lookup.
+            
+        Returns:
+            Dict with sub_queries, entities_found, and retrieval_plan.
+        """
+        result = {
+            "original_query": query,
+            "sub_queries": [query],
+            "entities_found": [],
+            "entity_nodes": {},
+            "retrieval_plan": [],
+        }
+        
+        if not self.kg:
+            return result
+        
+        # Step 1: Extract entity names from query
+        entity_names = self._extract_entity_names(query)
+        
+        if not entity_names:
+            return result
+        
+        # Step 2: Look up entities in knowledge graph
+        entities_found = []
+        entity_nodes: dict[str, list[str]] = {}
+        
+        for name in entity_names:
+            matches = self.kg.find_entities_by_name(name, fuzzy=True)
+            
+            # Filter by document if specified
+            if doc_id:
+                matches = [e for e in matches if doc_id in e.document_ids]
+            
+            for entity in matches:
+                if entity not in entities_found:
+                    entities_found.append(entity)
+                    # Get nodes where this entity is mentioned
+                    entity_nodes[entity.id] = list(entity.node_ids)
+        
+        result["entities_found"] = entities_found
+        result["entity_nodes"] = entity_nodes
+        
+        if not entities_found:
+            return result
+        
+        # Step 3: Get related entities and relationships
+        related_entities = []
+        relationships = []
+        
+        for entity in entities_found:
+            # Get entities co-mentioned with this one
+            co_mentions = self.kg.get_entities_mentioned_together(entity.id)
+            for related, count in co_mentions[:5]:  # Top 5 co-mentions
+                if related not in related_entities:
+                    related_entities.append(related)
+            
+            # Get relationships
+            rels = self.kg.get_entity_relationships(entity.id)
+            relationships.extend(rels)
+        
+        # Step 4: Generate entity-focused sub-queries
+        sub_queries = self._generate_entity_sub_queries(
+            query, entities_found, related_entities, relationships
+        )
+        
+        result["sub_queries"] = sub_queries
+        result["related_entities"] = related_entities
+        result["relationships"] = relationships
+        
+        # Step 5: Create retrieval plan
+        result["retrieval_plan"] = self._create_retrieval_plan(
+            query, entities_found, entity_nodes, relationships
+        )
+        
+        logger.debug(
+            "entity_aware_decomposition",
+            entities=len(entities_found),
+            sub_queries=len(sub_queries),
+            relationships=len(relationships),
+        )
+        
+        return result
+    
+    def _extract_entity_names(self, query: str) -> list[str]:
+        """Extract potential entity names from a query."""
+        entity_names = []
+        
+        # Use LLM if available
+        if self._llm_fn:
+            try:
+                prompt = f"""Extract entity names (people, organizations, places, documents) from this query.
+
+Query: {query}
+
+Return as JSON array of names:
+["Name 1", "Name 2"]
+
+JSON only:"""
+                
+                response = self._llm_fn(prompt)
+                json_match = re.search(r'\[[\s\S]*?\]', response)
+                if json_match:
+                    import json
+                    entity_names = json.loads(json_match.group())
+                    
+            except Exception as e:
+                logger.debug("entity_extraction_llm_failed", error=str(e))
+        
+        # Fallback: extract capitalized phrases
+        if not entity_names:
+            # Find capitalized words (likely proper nouns)
+            proper_nouns = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', query)
+            entity_names = proper_nouns
+        
+        return entity_names
+    
+    def _generate_entity_sub_queries(
+        self,
+        query: str,
+        entities: list,
+        related: list,
+        relationships: list,
+    ) -> list[str]:
+        """Generate sub-queries focused on entities."""
+        sub_queries = []
+        
+        if not self._llm_fn:
+            # Simple decomposition: one query per entity
+            for entity in entities[:3]:
+                sub_queries.append(
+                    f"Find information about {entity.canonical_name}: {query}"
+                )
+            return sub_queries if sub_queries else [query]
+        
+        # Use LLM for intelligent decomposition
+        try:
+            entity_names = [e.canonical_name for e in entities]
+            related_names = [e.canonical_name for e in related[:5]]
+            
+            rel_descriptions = []
+            for rel in relationships[:10]:
+                rel_descriptions.append(
+                    f"- {rel.source_id} {rel.type.value} {rel.target_id}"
+                )
+            
+            prompt = f"""Decompose this query into focused sub-queries based on the entities.
+
+Query: {query}
+
+Key entities found: {', '.join(entity_names)}
+Related entities: {', '.join(related_names)}
+
+Known relationships:
+{chr(10).join(rel_descriptions) if rel_descriptions else '(none)'}
+
+Generate 1-5 focused sub-queries. Each should target specific entities or relationships.
+
+Return as JSON:
+{{"sub_queries": ["query 1", "query 2"]}}
+
+JSON only:"""
+            
+            response = self._llm_fn(prompt)
+            json_match = re.search(r'\{[\s\S]*?\}', response)
+            if json_match:
+                import json
+                result = json.loads(json_match.group())
+                sub_queries = result.get("sub_queries", [])
+                
+        except Exception as e:
+            logger.debug("sub_query_generation_failed", error=str(e))
+        
+        return sub_queries if sub_queries else [query]
+    
+    def _create_retrieval_plan(
+        self,
+        query: str,
+        entities: list,
+        entity_nodes: dict[str, list[str]],
+        relationships: list,
+    ) -> list[dict[str, Any]]:
+        """Create a retrieval plan based on entities."""
+        plan = []
+        
+        # Priority 1: Nodes with direct entity mentions
+        priority_nodes = set()
+        for entity in entities:
+            nodes = entity_nodes.get(entity.id, [])
+            for node_id in nodes:
+                priority_nodes.add(node_id)
+                plan.append({
+                    "node_id": node_id,
+                    "priority": 1,
+                    "reason": f"Contains {entity.canonical_name}",
+                    "entity_id": entity.id,
+                })
+        
+        # Priority 2: Nodes involved in relationships
+        for rel in relationships:
+            if rel.source_type == "node" and rel.source_id not in priority_nodes:
+                plan.append({
+                    "node_id": rel.source_id,
+                    "priority": 2,
+                    "reason": f"Related via {rel.type.value}",
+                    "relationship_id": rel.id,
+                })
+            if rel.target_type == "node" and rel.target_id not in priority_nodes:
+                plan.append({
+                    "node_id": rel.target_id,
+                    "priority": 2,
+                    "reason": f"Related via {rel.type.value}",
+                    "relationship_id": rel.id,
+                })
+        
+        # Sort by priority
+        plan.sort(key=lambda x: x["priority"])
+        
+        return plan
+
+
+# =============================================================================
 # Factory Function
 # =============================================================================
 
@@ -1186,6 +2033,7 @@ def create_rlm_navigator(
     skeleton: dict[str, SkeletonNode],
     kv_store: KVStore,
     config: RLMConfig | None = None,
+    knowledge_graph=None,
 ) -> RLMNavigator:
     """
     Create an RLM Navigator instance.
@@ -1194,6 +2042,7 @@ def create_rlm_navigator(
         skeleton: Skeleton index.
         kv_store: KV store with full content.
         config: Optional configuration.
+        knowledge_graph: Optional knowledge graph for entity-aware queries.
         
     Returns:
         Configured RLMNavigator.
@@ -1201,9 +2050,13 @@ def create_rlm_navigator(
     Example:
         from rnsr import ingest_document, build_skeleton_index
         from rnsr.agent.rlm_navigator import create_rlm_navigator, RLMConfig
+        from rnsr.indexing.knowledge_graph import KnowledgeGraph
         
         result = ingest_document("contract.pdf")
         skeleton, kv_store = build_skeleton_index(result.tree)
+        
+        # With knowledge graph for entity-aware queries
+        kg = KnowledgeGraph("./data/kg.db")
         
         # With custom config
         config = RLMConfig(
@@ -1212,11 +2065,11 @@ def create_rlm_navigator(
             enable_verification=True,
         )
         
-        navigator = create_rlm_navigator(skeleton, kv_store, config)
+        navigator = create_rlm_navigator(skeleton, kv_store, config, kg)
         result = navigator.navigate("What are the liability terms?")
         print(result["answer"])
     """
-    nav = RLMNavigator(skeleton, kv_store, config)
+    nav = RLMNavigator(skeleton, kv_store, config, knowledge_graph)
     
     # Configure LLM
     try:

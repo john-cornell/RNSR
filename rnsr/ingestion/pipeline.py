@@ -607,5 +607,236 @@ def _get_xy_cut_leaves(node) -> list:
     return leaves
 
 
+# =============================================================================
+# Entity Extraction Integration
+# =============================================================================
+
+
+def extract_entities_from_tree(
+    tree: DocumentTree,
+    doc_id: str | None = None,
+    extract_relationships: bool = True,
+) -> dict:
+    """
+    Extract entities and relationships from an ingested document tree.
+    
+    Uses the RLM Unified Extractor - the most accurate approach:
+    1. LLM writes extraction code based on document
+    2. Code executes on DOC_VAR (grounded in actual text)
+    3. ToT validates with probabilities
+    4. Cross-validation between entities and relationships
+    
+    Args:
+        tree: The ingested DocumentTree.
+        doc_id: Document ID (defaults to tree.id).
+        extract_relationships: Whether to also extract relationships.
+        
+    Returns:
+        Dictionary containing:
+        - entities: List of extracted Entity objects
+        - relationships: List of extracted Relationship objects
+        - stats: Extraction statistics
+        
+    Example:
+        result = ingest_document("contract.pdf")
+        extraction = extract_entities_from_tree(result.tree)
+        
+        # Store in knowledge graph
+        for entity in extraction["entities"]:
+            kg.add_entity(entity)
+    """
+    from rnsr.extraction import (
+        RLMUnifiedExtractor,
+        merge_entities,
+    )
+    
+    doc_id = doc_id or tree.id
+    
+    # Use RLM Unified Extractor (LLM writes code + ToT validation)
+    extractor = RLMUnifiedExtractor(
+        enable_type_learning=True,
+        enable_tot_validation=True,
+        enable_cross_validation=True,
+    )
+    
+    all_entities = []
+    all_relationships = []
+    
+    # Collect all nodes for processing
+    nodes_to_process = _collect_nodes(tree.root, doc_id)
+    
+    logger.info(
+        "entity_extraction_started",
+        doc_id=doc_id,
+        node_count=len(nodes_to_process),
+        extractor="RLMUnifiedExtractor",
+    )
+    
+    # Extract entities AND relationships from each node
+    for node_data in nodes_to_process:
+        result = extractor.extract(
+            node_id=node_data["node_id"],
+            doc_id=doc_id,
+            header=node_data["header"],
+            content=node_data["content"],
+            page_num=node_data.get("page_num"),
+        )
+        
+        if result.entities:
+            all_entities.extend(result.entities)
+        
+        if extract_relationships and result.relationships:
+            all_relationships.extend(result.relationships)
+    
+    # Merge duplicate entities
+    merged_entities = merge_entities(all_entities)
+    
+    stats = {
+        "nodes_processed": len(nodes_to_process),
+        "entities_extracted": len(all_entities),
+        "entities_after_merge": len(merged_entities),
+        "relationships_extracted": len(all_relationships),
+        "entity_types": _count_entity_types(merged_entities),
+        "extraction_method": "rlm_unified",
+    }
+    
+    logger.info(
+        "entity_extraction_complete",
+        doc_id=doc_id,
+        **stats,
+    )
+    
+    return {
+        "entities": merged_entities,
+        "relationships": all_relationships,
+        "stats": stats,
+    }
+
+
+def _collect_nodes(node, doc_id: str, collected: list | None = None) -> list[dict]:
+    """
+    Recursively collect all nodes from a DocumentNode tree.
+    
+    Args:
+        node: Root DocumentNode.
+        doc_id: Document ID.
+        collected: List to collect into.
+        
+    Returns:
+        List of node data dictionaries.
+    """
+    if collected is None:
+        collected = []
+    
+    # Add this node if it has content
+    if node.content or node.header:
+        collected.append({
+            "node_id": node.id,
+            "header": node.header,
+            "content": node.content,
+            "page_num": node.page_num,
+            "level": node.level,
+        })
+    
+    # Process children
+    for child in node.children:
+        _collect_nodes(child, doc_id, collected)
+    
+    return collected
+
+
+def _count_entity_types(entities: list) -> dict[str, int]:
+    """Count entities by type."""
+    counts: dict[str, int] = {}
+    for entity in entities:
+        type_name = entity.type.value
+        counts[type_name] = counts.get(type_name, 0) + 1
+    return counts
+
+
+def ingest_with_entities(
+    pdf_path: Path | str,
+    knowledge_graph=None,
+    extract_relationships: bool = True,
+    link_entities: bool = True,
+    **ingest_kwargs,
+) -> dict:
+    """
+    Ingest a document and extract entities in a single operation.
+    
+    Combines document ingestion with entity extraction, optionally
+    storing results in a knowledge graph.
+    
+    Args:
+        pdf_path: Path to the PDF file.
+        knowledge_graph: Optional KnowledgeGraph to store entities.
+        extract_relationships: Whether to extract relationships.
+        link_entities: Whether to link entities across documents.
+        **ingest_kwargs: Additional arguments for ingest_document.
+        
+    Returns:
+        Dictionary containing:
+        - ingestion_result: The IngestionResult
+        - extraction: Entity extraction results
+        - links: Entity links (if link_entities=True)
+        
+    Example:
+        from rnsr.indexing.knowledge_graph import KnowledgeGraph
+        
+        kg = KnowledgeGraph("./data/kg.db")
+        result = ingest_with_entities("contract.pdf", knowledge_graph=kg)
+        
+        print(f"Found {len(result['extraction']['entities'])} entities")
+    """
+    # Ingest document
+    ingestion_result = ingest_document(pdf_path, **ingest_kwargs)
+    
+    # Extract entities
+    extraction = extract_entities_from_tree(
+        tree=ingestion_result.tree,
+        extract_relationships=extract_relationships,
+    )
+    
+    result = {
+        "ingestion_result": ingestion_result,
+        "extraction": extraction,
+        "links": [],
+    }
+    
+    # Store in knowledge graph if provided
+    if knowledge_graph is not None:
+        from rnsr.extraction import EntityLinker
+        
+        # Store entities
+        for entity in extraction["entities"]:
+            knowledge_graph.add_entity(entity)
+        
+        # Store relationships
+        for relationship in extraction["relationships"]:
+            knowledge_graph.add_relationship(relationship)
+        
+        # Link entities if enabled
+        if link_entities:
+            linker = EntityLinker(knowledge_graph)
+            links = linker.link_all_entities_in_document(ingestion_result.tree.id)
+            result["links"] = links
+        
+        logger.info(
+            "stored_in_knowledge_graph",
+            doc_id=ingestion_result.tree.id,
+            entities=len(extraction["entities"]),
+            relationships=len(extraction["relationships"]),
+            links=len(result["links"]),
+        )
+    
+    return result
+
+
 # Convenience exports
-__all__ = ["ingest_document", "ingest_document_enhanced", "IngestionResult"]
+__all__ = [
+    "ingest_document",
+    "ingest_document_enhanced",
+    "ingest_with_entities",
+    "extract_entities_from_tree",
+    "IngestionResult",
+]

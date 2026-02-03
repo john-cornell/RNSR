@@ -72,6 +72,9 @@ print("Importing RNSR modules...", flush=True)
 from rnsr import ingest_document, build_skeleton_index, run_navigator
 from rnsr.models import DocumentTree, DocumentNode
 from rnsr.indexing import KVStore
+from rnsr.indexing.knowledge_graph import KnowledgeGraph, InMemoryKnowledgeGraph
+from rnsr.ingestion.pipeline import extract_entities_from_tree
+from rnsr.extraction.models import Entity, EntityType
 print("RNSR modules imported.", flush=True)
 print("Defining SessionState class...", flush=True)
 
@@ -81,15 +84,18 @@ class SessionState:
         self.tree: DocumentTree | None = None
         self.skeleton: dict[str, Any] | None = None
         self.kv_store: KVStore | None = None
+        self.knowledge_graph: InMemoryKnowledgeGraph | None = None
         self.document_name: str = ""
         self.chat_history: list[tuple[str, str]] = []
+        self.entities: list[Entity] = []
+        self.extraction_stats: dict[str, Any] = {}
 
 
 state = SessionState()
 print("SessionState created.", flush=True)
 
 
-def process_document(file) -> str:
+def process_document(file, extract_entities: bool = True) -> str:
     """Process an uploaded PDF document."""
     if file is None:
         return "❌ Please upload a PDF file."
@@ -107,15 +113,46 @@ def process_document(file) -> str:
         state.document_name = Path(file_path).name
         state.chat_history = []
         
+        # Initialize knowledge graph
+        state.knowledge_graph = InMemoryKnowledgeGraph()
+        state.entities = []
+        state.extraction_stats = {}
+        
         # Get document stats
         node_count = state.tree.total_nodes if state.tree else 0
         root_sections = len(state.tree.root.children) if state.tree and state.tree.root else 0
+        
+        # Extract entities if enabled
+        entity_info = ""
+        if extract_entities and state.tree:
+            try:
+                extraction = extract_entities_from_tree(state.tree)
+                state.entities = extraction.get("entities", [])
+                state.extraction_stats = extraction.get("stats", {})
+                
+                # Store entities in knowledge graph
+                for entity in state.entities:
+                    state.knowledge_graph.add_entity(entity)
+                
+                # Store relationships
+                for rel in extraction.get("relationships", []):
+                    state.knowledge_graph.add_relationship(rel)
+                
+                # Format entity summary
+                entity_counts = state.extraction_stats.get("entity_types", {})
+                if entity_counts:
+                    entity_parts = [f"{v} {k}s" for k, v in entity_counts.items()]
+                    entity_info = f"\n🔍 **Entities:** {', '.join(entity_parts)}"
+                    entity_info += f"\n🔗 **Relationships:** {state.extraction_stats.get('relationships_extracted', 0)}"
+                
+            except Exception as e:
+                entity_info = f"\n⚠️ Entity extraction skipped: {str(e)[:50]}"
         
         return f"""✅ **Document processed successfully!**
 
 📄 **File:** {state.document_name}
 🌳 **Hierarchy nodes:** {node_count}
-📊 **Root sections:** {root_sections}
+📊 **Root sections:** {root_sections}{entity_info}
 
 You can now ask questions about this document in the chat below."""
         
@@ -136,6 +173,37 @@ def chat(message: str, history: list) -> tuple[str, list]:
         return "", history
     
     try:
+        # Check if this is an entity-related query and we have entities
+        entity_context = ""
+        if state.knowledge_graph and state.entities:
+            # Search for mentioned entities in the query
+            mentioned_entities = []
+            query_lower = message.lower()
+            
+            for entity in state.entities:
+                if entity.canonical_name.lower() in query_lower:
+                    mentioned_entities.append(entity)
+                else:
+                    for alias in entity.aliases:
+                        if alias.lower() in query_lower:
+                            mentioned_entities.append(entity)
+                            break
+            
+            # If we found entities, add context
+            if mentioned_entities:
+                context_parts = []
+                for entity in mentioned_entities[:3]:
+                    # Get related entities
+                    co_mentions = state.knowledge_graph.get_entities_mentioned_together(entity.id)
+                    related = [e.canonical_name for e, _ in co_mentions[:3]]
+                    
+                    context_parts.append(
+                        f"- {entity.canonical_name} ({entity.type.value})"
+                        + (f", related to: {', '.join(related)}" if related else "")
+                    )
+                
+                entity_context = "\n\n*Entity context:*\n" + "\n".join(context_parts)
+        
         # Run the navigator agent
         answer = run_navigator(
             question=message,
@@ -145,6 +213,10 @@ def chat(message: str, history: list) -> tuple[str, list]:
         
         # Format the response
         response = str(answer)
+        
+        # Append entity context if available
+        if entity_context:
+            response += entity_context
         
         # Update history with Gradio 6.x message format
         new_history = history + [
@@ -197,6 +269,135 @@ def _visualize_node(node: DocumentNode, lines: list, prefix: str, is_last: bool)
             _visualize_node(child, lines, child_prefix, i == len(node.children) - 1)
 
 
+def get_entities_visualization() -> str:
+    """Generate a visualization of extracted entities."""
+    if not state.entities:
+        return "No entities extracted. Process a document first."
+    
+    lines = []
+    lines.append(f"## 📊 Extracted Entities ({len(state.entities)} total)\n")
+    
+    # Group by type
+    by_type: dict[str, list[Entity]] = {}
+    for entity in state.entities:
+        type_name = entity.type.value
+        if type_name not in by_type:
+            by_type[type_name] = []
+        by_type[type_name].append(entity)
+    
+    # Format each type group
+    type_icons = {
+        "person": "👤",
+        "organization": "🏢",
+        "date": "📅",
+        "event": "📌",
+        "legal_concept": "⚖️",
+        "location": "📍",
+        "reference": "📎",
+        "monetary": "💰",
+        "document": "📄",
+        "other": "🏷️",
+    }
+    
+    for type_name, entities in sorted(by_type.items()):
+        icon = type_icons.get(type_name, "•")
+        display_name = type_name.replace('_', ' ').title()
+        lines.append(f"\n### {icon} {display_name} ({len(entities)})\n")
+        
+        for entity in entities[:15]:  # Limit to 15 per type
+            mentions = len(entity.mentions)
+            aliases = f" (aka: {', '.join(entity.aliases[:2])})" if entity.aliases else ""
+            
+            # For OTHER type, show the original type if available
+            original_type = ""
+            if type_name == "other" and entity.metadata.get("original_type"):
+                original_type = f" [{entity.metadata['original_type']}]"
+            
+            lines.append(f"- **{entity.canonical_name}**{original_type}{aliases} - {mentions} mention(s)")
+        
+        if len(entities) > 15:
+            lines.append(f"  ... and {len(entities) - 15} more")
+    
+    return "\n".join(lines)
+
+
+def get_relationships_visualization() -> str:
+    """Generate a visualization of entity relationships."""
+    if not state.knowledge_graph:
+        return "No knowledge graph available. Process a document first."
+    
+    stats = state.knowledge_graph.get_stats()
+    
+    if stats.get("relationship_count", 0) == 0:
+        return "No relationships extracted yet."
+    
+    lines = []
+    lines.append(f"## 🔗 Entity Relationships\n")
+    lines.append(f"**Total relationships:** {stats.get('relationship_count', 0)}\n")
+    
+    # Get some example relationships
+    if state.entities:
+        lines.append("\n### Key Connections\n")
+        
+        shown = 0
+        for entity in state.entities[:10]:
+            rels = state.knowledge_graph.get_entity_relationships(entity.id)
+            for rel in rels[:3]:
+                # Get target entity name
+                target = state.knowledge_graph.get_entity(rel.target_id)
+                target_name = target.canonical_name if target else rel.target_id
+                
+                rel_type = rel.type.value.replace("_", " ").title()
+                lines.append(f"- {entity.canonical_name} → **{rel_type}** → {target_name}")
+                shown += 1
+                
+                if shown >= 20:
+                    break
+            if shown >= 20:
+                break
+        
+        if shown == 0:
+            lines.append("*(No entity-to-entity relationships found)*")
+    
+    return "\n".join(lines)
+
+
+def search_entities(query: str) -> str:
+    """Search for entities matching a query."""
+    if not state.knowledge_graph:
+        return "No knowledge graph available."
+    
+    if not query.strip():
+        return "Enter a search term."
+    
+    results = state.knowledge_graph.find_entities_by_name(query.strip(), fuzzy=True)
+    
+    if not results:
+        return f"No entities found matching '{query}'."
+    
+    lines = [f"### Search Results for '{query}'\n"]
+    
+    for entity in results[:10]:
+        type_name = entity.type.value.replace("_", " ").title()
+        mentions = len(entity.mentions)
+        
+        lines.append(f"**{entity.canonical_name}** ({type_name})")
+        lines.append(f"  - Mentions: {mentions}")
+        
+        if entity.aliases:
+            lines.append(f"  - Also known as: {', '.join(entity.aliases[:3])}")
+        
+        # Get related entities
+        co_mentions = state.knowledge_graph.get_entities_mentioned_together(entity.id)
+        if co_mentions:
+            related = [e.canonical_name for e, _ in co_mentions[:3]]
+            lines.append(f"  - Related to: {', '.join(related)}")
+        
+        lines.append("")
+    
+    return "\n".join(lines)
+
+
 print("All functions defined.", flush=True)
 
 # Create the Gradio interface
@@ -209,13 +410,13 @@ def create_demo():
         # 🔍 RNSR - Recursive Neural-Symbolic Retriever
         
         Upload a PDF document and ask questions about it. RNSR preserves the document's 
-        hierarchical structure for better context understanding.
+        hierarchical structure and extracts entities for better context understanding.
         
-        **How it works:**
-        1. Upload a PDF document
-        2. RNSR extracts the document hierarchy using font analysis
-        3. Ask questions in natural language
-        4. Get accurate answers with structural context
+        **Features:**
+        - 📊 Hierarchical document structure extraction
+        - 🔍 Entity extraction (people, organizations, dates, etc.)
+        - 🔗 Relationship mapping between entities
+        - 💬 Natural language Q&A with structural context
         """)
         
         with gr.Row():
@@ -226,23 +427,45 @@ def create_demo():
                     file_types=[".pdf"],
                     type="filepath"
                 )
+                extract_entities_cb = gr.Checkbox(
+                    label="Extract entities",
+                    value=True,
+                    info="Enable entity and relationship extraction"
+                )
                 process_btn = gr.Button("🔄 Process Document", variant="primary")
                 status_output = gr.Markdown("*No document loaded*")
                 
-                with gr.Accordion("🌳 Document Structure", open=False):
-                    tree_output = gr.Textbox(
-                        label="Hierarchy",
-                        lines=15,
-                        max_lines=30,
-                        interactive=False
-                    )
-                    refresh_tree_btn = gr.Button("Refresh Tree View")
+                with gr.Tabs():
+                    with gr.TabItem("🌳 Structure"):
+                        tree_output = gr.Textbox(
+                            label="Document Hierarchy",
+                            lines=12,
+                            max_lines=25,
+                            interactive=False
+                        )
+                        refresh_tree_btn = gr.Button("Refresh", size="sm")
+                    
+                    with gr.TabItem("🔍 Entities"):
+                        entities_output = gr.Markdown("*Process a document to see entities*")
+                        refresh_entities_btn = gr.Button("Refresh", size="sm")
+                    
+                    with gr.TabItem("🔗 Relationships"):
+                        relationships_output = gr.Markdown("*Process a document to see relationships*")
+                        refresh_rels_btn = gr.Button("Refresh", size="sm")
+                    
+                    with gr.TabItem("🔎 Search"):
+                        entity_search = gr.Textbox(
+                            label="Search entities",
+                            placeholder="Enter name to search...",
+                        )
+                        search_btn = gr.Button("Search", size="sm")
+                        search_results = gr.Markdown("")
             
             with gr.Column(scale=2):
                 gr.Markdown("### 💬 Chat with your Document")
                 chatbot = gr.Chatbot(
                     label="Conversation",
-                    height=400,
+                    height=450,
                     show_label=False,
                 )
                 
@@ -261,18 +484,19 @@ def create_demo():
         ---
         ### Example Questions
         - "What are the main sections of this document?"
-        - "Summarize the key points"
-        - "What does section 3.2 discuss?"
-        - "Find information about [specific topic]"
+        - "Who are the key people mentioned?"
+        - "What happened on [specific date]?"
+        - "What is the relationship between [Person A] and [Organization B]?"
+        - "Summarize the key findings"
         
         ---
-        *Powered by RNSR - [GitHub](https://github.com/theeufj/RNSR)*
+        *Powered by RNSR with Ontological Entity Understanding - [GitHub](https://github.com/theeufj/RNSR)*
         """)
         
         # Event handlers
         process_btn.click(
             fn=process_document,
-            inputs=[file_input],
+            inputs=[file_input, extract_entities_cb],
             outputs=[status_output]
         )
         
@@ -280,6 +504,30 @@ def create_demo():
             fn=get_tree_visualization,
             inputs=[],
             outputs=[tree_output]
+        )
+        
+        refresh_entities_btn.click(
+            fn=get_entities_visualization,
+            inputs=[],
+            outputs=[entities_output]
+        )
+        
+        refresh_rels_btn.click(
+            fn=get_relationships_visualization,
+            inputs=[],
+            outputs=[relationships_output]
+        )
+        
+        search_btn.click(
+            fn=search_entities,
+            inputs=[entity_search],
+            outputs=[search_results]
+        )
+        
+        entity_search.submit(
+            fn=search_entities,
+            inputs=[entity_search],
+            outputs=[search_results]
         )
         
         msg_input.submit(

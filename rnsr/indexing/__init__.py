@@ -1,5 +1,5 @@
 """
-Indexing Module - Skeleton Index Construction
+Indexing Module - Skeleton Index Construction and Knowledge Graph
 
 Responsible for:
 1. IndexNode construction (summaries only)
@@ -7,6 +7,7 @@ Responsible for:
 3. KV store for full text
 4. Persistence (save/load indexes)
 5. Semantic search for O(log N) retrieval
+6. Knowledge graph for entity and relationship storage
 """
 
 from rnsr.indexing.kv_store import InMemoryKVStore, KVStore, SQLiteKVStore
@@ -26,6 +27,10 @@ from rnsr.indexing.persistence import (
 from rnsr.indexing.semantic_search import (
     SemanticSearcher,
     create_semantic_searcher,
+)
+from rnsr.indexing.knowledge_graph import (
+    KnowledgeGraph,
+    InMemoryKnowledgeGraph,
 )
 from rnsr.models import SkeletonNode
 
@@ -49,4 +54,7 @@ __all__ = [
     # Semantic Search
     "SemanticSearcher",
     "create_semantic_searcher",
+    # Knowledge Graph
+    "KnowledgeGraph",
+    "InMemoryKnowledgeGraph",
 ]
