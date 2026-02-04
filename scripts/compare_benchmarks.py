@@ -242,7 +242,7 @@ class RNSRSystem:
     def ingest(self, pdf_path: Path):
         """Ingest document with hierarchical processing."""
         from rnsr.ingestion.pipeline import ingest_document
-        from rnsr.indexing.skeleton_builder import build_skeleton_index
+        from rnsr.indexing import build_skeleton_index
         
         result = ingest_document(pdf_path)
         self.tree = result.tree
@@ -275,7 +275,7 @@ class RNSRSystem:
         
         self.tree = DocumentTree(root=root, id="doc")
         
-        from rnsr.indexing.skeleton_builder import build_skeleton_index
+        from rnsr.indexing import build_skeleton_index
         self.skeleton, self.kv_store = build_skeleton_index(self.tree)
         
         console.print(f"[dim]RNSR: {self.tree.total_nodes} nodes from text[/dim]")
