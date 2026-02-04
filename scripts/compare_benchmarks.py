@@ -290,7 +290,6 @@ class RNSRSystem:
             self.navigator = RLMNavigator(
                 skeleton=self.skeleton,
                 kv_store=self.kv_store,
-                tree=self.tree,
             )
         
         result = self.navigator.answer(question)
