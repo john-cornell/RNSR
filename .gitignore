@@ -80,3 +80,4 @@ site/
 # Test PDFs
 test_pdfs/# Test documents (too large for GitHub)
 rnsr/test-documents/
+scripts/office_demo.py
