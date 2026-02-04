@@ -17,10 +17,11 @@ help:
 	@echo ""
 	@echo "Usage: make [target]"
 	@echo ""
-	@echo "Demo & Presentation:"
-	@echo "  demo          Launch the Gradio web demo (http://localhost:7860)"
-	@echo "  demo-office   Run presentation-ready office demo"
-	@echo "  benchmark     Run benchmarks on sample documents"
+	@echo "Demo & Benchmarks:"
+	@echo "  demo              Launch the Gradio web demo (http://localhost:7860)"
+	@echo "  demo-office       Run presentation-ready office demo (local only)"
+	@echo "  benchmark         Run performance benchmarks"
+	@echo "  benchmark-compare Compare RNSR vs Naive RAG vs Long Context"
 	@echo ""
 	@echo "Testing:"
 	@echo "  test          Run all tests"
@@ -77,6 +78,19 @@ benchmark-pdf:
 	@echo "Usage: make benchmark-pdf PDF=path/to/document.pdf"
 	@test -n "$(PDF)" || (echo "Error: PDF is required" && exit 1)
 	$(PYTHON) scripts/benchmark_demo.py --pdf $(PDF)
+
+# Compare RNSR vs Naive RAG vs Long Context
+benchmark-compare:
+	@echo "📊 Running Comparison Benchmark..."
+	@echo "   Comparing: RNSR vs Naive RAG vs Long Context LLM"
+	@echo ""
+	$(PYTHON) scripts/compare_benchmarks.py --quick
+
+# Compare with your own PDF
+benchmark-compare-pdf:
+	@echo "Usage: make benchmark-compare-pdf PDF=path/to/document.pdf"
+	@test -n "$(PDF)" || (echo "Error: PDF is required" && exit 1)
+	$(PYTHON) scripts/compare_benchmarks.py --pdf $(PDF)
 
 # Run all tests
 test:
