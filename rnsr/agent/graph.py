@@ -384,10 +384,62 @@ def _format_children_summaries(
     return "\n".join(lines) if lines else "(no children found)"
 
 
+def _verify_node_relevance(
+    node_id: str,
+    query: str,
+    kv_store: Any,
+    min_keyword_overlap: float = 0.2,
+) -> tuple[bool, float]:
+    """
+    Verify that a node's full content is actually relevant to the query.
+    
+    This prevents ToT from selecting nodes based on misleading summaries.
+    
+    Args:
+        node_id: The node ID to verify.
+        query: The query to check relevance against.
+        kv_store: Key-value store to fetch full content.
+        min_keyword_overlap: Minimum fraction of query keywords that must appear.
+        
+    Returns:
+        Tuple of (is_relevant, relevance_score).
+    """
+    if not kv_store or not query:
+        return True, 1.0  # Can't verify without store or query
+    
+    content = kv_store.get(node_id) or ""
+    if not content:
+        return False, 0.0
+    
+    # Extract keywords from query (basic tokenization)
+    query_lower = query.lower()
+    stop_words = {
+        "what", "is", "the", "a", "an", "of", "in", "to", "for", "and", "or",
+        "how", "when", "where", "who", "which", "that", "this", "are", "was",
+        "were", "be", "been", "being", "have", "has", "had", "do", "does",
+        "did", "will", "would", "could", "should", "may", "might", "can",
+        "with", "from", "by", "on", "at", "as", "it", "its", "their", "they",
+    }
+    query_words = set(re.findall(r'\b[a-z]{3,}\b', query_lower)) - stop_words
+    
+    if not query_words:
+        return True, 1.0  # No meaningful keywords
+    
+    # Check content for query keywords
+    content_lower = content.lower()
+    matched_keywords = sum(1 for kw in query_words if kw in content_lower)
+    overlap_score = matched_keywords / len(query_words)
+    
+    is_relevant = overlap_score >= min_keyword_overlap
+    
+    return is_relevant, overlap_score
+
+
 def evaluate_children_with_tot(
     state: AgentState,
     skeleton: dict[str, SkeletonNode],
     top_k_override: int | None = None,
+    kv_store: Any = None,
 ) -> dict[str, Any]:
     """
     Use Tree of Thoughts prompting to evaluate child nodes.
@@ -400,6 +452,7 @@ def evaluate_children_with_tot(
         state: Current agent state.
         skeleton: Skeleton index.
         top_k_override: Optional override for adaptive exploration.
+        kv_store: Optional key-value store for content verification.
         
     Returns:
         Dictionary with evaluations, selected_nodes, is_dead_end, and backtrack_reason.
@@ -470,6 +523,45 @@ Malformed JSON:
                     repaired_response_text = match.group(0)
 
             result = json.loads(repaired_response_text)
+        
+        # CONTENT VERIFICATION: Verify selected nodes actually contain relevant content
+        # This prevents ToT from being misled by misleading summaries
+        if kv_store and result.get("selected_nodes"):
+            query = state.get("current_sub_question") or state.get("question", "")
+            original_selected = result["selected_nodes"]
+            verified_selected = []
+            unverified = []
+            
+            for node_id in original_selected:
+                is_relevant, score = _verify_node_relevance(node_id, query, kv_store)
+                if is_relevant:
+                    verified_selected.append(node_id)
+                else:
+                    unverified.append({"node_id": node_id, "score": score})
+            
+            if unverified:
+                logger.warning(
+                    "tot_nodes_failed_content_verification",
+                    original_count=len(original_selected),
+                    verified_count=len(verified_selected),
+                    unverified=unverified,
+                )
+            
+            # Update result with verified nodes
+            result["selected_nodes"] = verified_selected
+            result["unverified_nodes"] = [u["node_id"] for u in unverified]
+            
+            # If all nodes failed verification, mark as potential dead end
+            if not verified_selected and original_selected:
+                logger.warning(
+                    "tot_all_nodes_failed_verification",
+                    original_nodes=original_selected,
+                    query=query[:100],
+                )
+                # Don't mark as dead end immediately - fallback to exploring unverified
+                # nodes since summaries might still be useful
+                result["selected_nodes"] = original_selected[:2]  # Keep top 2 as fallback
+                result["verification_warning"] = "All selected nodes failed content verification"
         
         logger.debug(
             "tot_evaluation_complete",
@@ -1048,10 +1140,16 @@ def synthesize_answer(
             options = metadata.get("options")
 
             if options and isinstance(options, list) and len(options) > 0:
-                # QuALITY multiple-choice question
+                # QuALITY multiple-choice question - STRICT GROUNDING MODE
                 # Ensure each option is a string and format with letters
                 options_text = "\n".join([f"{chr(65+i)}. {str(opt)}" for i, opt in enumerate(options)])
-                prompt = f"""Based on the provided context, answer this multiple-choice question.
+                prompt = f"""Answer this multiple-choice question using ONLY the provided context. Do NOT infer or guess.
+
+STRICT GROUNDING RULES:
+1. Select the option that is EXPLICITLY supported by the context
+2. You MUST cite the exact text from the context that supports your choice
+3. If NO option is explicitly supported, respond with: "Cannot determine from context"
+4. Do NOT choose an option based on inference or general knowledge
 
 Question: {question}
 
@@ -1063,28 +1161,32 @@ Context:
 
 Instructions:
 1. Read the context carefully
-2. Determine which option is best supported by the evidence in the context
-3. Respond with ONLY the letter and full text of the correct option
-4. Format: "X. [complete option text]" where X is A, B, C, or D
+2. Find the EXACT text that supports one of the options
+3. Respond with the letter, full option text, AND your supporting quote
+4. Format: "X. [option text] (Source: 'exact quote from context')"
 
 Your answer:"""
             else:
-                # Standard open-ended question
-                prompt = f"""Based on the following context, answer the question concisely.
+                # Standard open-ended question - STRICT GROUNDING MODE
+                prompt = f"""Answer the question using ONLY the provided context. Do NOT infer, guess, or add information not explicitly stated.
 
-IMPORTANT INSTRUCTIONS:
-- If the context contains information that DIRECTLY answers the question, provide that answer
-- If the context contains information that allows you to INFER the answer, provide your best inference
-- Use evidence from the context to support your answer
-- Only say "Cannot determine from available context" if the context is completely unrelated or missing critical information
-- It's better to provide a reasonable answer based on available evidence than to say "cannot determine"
+STRICT GROUNDING RULES:
+1. Answer ONLY using information explicitly stated in the context below
+2. For EVERY claim you make, cite the source by quoting the exact text in quotation marks
+3. Do NOT infer, deduce, or extrapolate beyond what is explicitly written
+4. If the answer is NOT explicitly stated in the context, respond with: "I cannot answer this from the provided text."
+5. If only a partial answer is available, state what IS explicitly mentioned and acknowledge what is missing
+
+FORMAT YOUR ANSWER AS:
+- Your answer with inline citations like: "The value is X" (Source: "exact quote from context")
+- If multiple sources support a claim, cite each one
 
 Question: {question}
 
 Context:
 {context_text}
 
-Answer (be concise, direct, and confident):"""
+Answer (cite sources for every claim, or state "I cannot answer this from the provided text"):"""
 
             response = llm.complete(prompt)
             answer = str(response).strip()

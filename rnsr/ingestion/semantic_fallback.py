@@ -9,10 +9,14 @@ Use this fallback when:
 - Document has uniform font size throughout
 - No headers can be detected via font analysis
 - Document is machine-generated with no formatting
+
+Enhancement: Before semantic splitting, we try PATTERN-BASED header detection
+to find textual markers like "1. HEADING", "ARTICLE I:", "Section 1:", etc.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import fitz
@@ -21,6 +25,148 @@ import structlog
 from rnsr.models import DocumentNode, DocumentTree
 
 logger = structlog.get_logger(__name__)
+
+
+# =============================================================================
+# Pattern-Based Header Detection (before semantic fallback)
+# =============================================================================
+
+# Patterns that indicate a section header in legal/contract documents
+# Each tuple: (pattern, level_override or None, header_group_indices)
+HEADER_PATTERNS = [
+    # Major sections: "1. PARTIES AND RECITALS" - must have capital word after dot
+    (r'^(\d{1,2})[\.\)]\s+([A-Z][A-Z\s]{2,}(?:[A-Za-z\s]*)?)$', 1),
+    # Sub-sections: "1.1 Service Provider" or "2.1.1 Details"
+    (r'^(\d{1,2}\.\d{1,2}(?:\.\d{1,2})?)\s+([A-Z][A-Za-z\s]+)', 2),
+    # Roman numerals: "I. HEADING" or "II. HEADING"
+    (r'^([IVXLC]{1,4})[\.\)]\s+([A-Z][A-Z\s]{2,}(?:[A-Za-z\s]*)?)$', 1),
+    # ARTICLE format: "ARTICLE I: Title" or "ARTICLE 1"
+    (r'^ARTICLE\s+([IVXLC\d]+)[\.:]\s*(.*)$', 1),
+    # Section format: "Section 1:" or "SECTION 1."
+    (r'^[Ss][Ee][Cc][Tt][Ii][Oo][Nn]\s+(\d+)[\.:]\s*(.*)$', 1),
+    # Exhibit/Appendix: "EXHIBIT A: TECHNICAL SPECIFICATIONS" 
+    (r'^(EXHIBIT|APPENDIX)\s+([A-Z\d]+)[\.:]\s*(.*)$', 1),
+    # All caps line (minimum 10 chars, standalone, typically a header)
+    (r'^([A-Z][A-Z\s]{10,})$', 1),
+    # Markdown-style headers - level based on # count
+    (r'^(#{1,3})\s+(.+)$', None),  # Level determined by # count
+]
+
+
+def _try_pattern_based_headers(text: str, title: str) -> DocumentTree | None:
+    """
+    Try to detect section headers using regex patterns.
+    
+    This is more accurate than semantic splitting for documents that have
+    textual markers like "1. INTRODUCTION" even without font variance.
+    
+    Returns:
+        DocumentTree if headers were found, None otherwise.
+    """
+    lines = text.split('\n')
+    sections = []
+    current_section = {"header": None, "content": [], "level": 1}
+    
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped:
+            current_section["content"].append("")
+            continue
+        
+        # Check if this line matches a header pattern
+        is_header = False
+        matched_header = None
+        matched_level = 1
+        
+        for pattern, level_override in HEADER_PATTERNS:
+            match = re.match(pattern, line_stripped, re.IGNORECASE)
+            if match:
+                # Extract the header text using the original line
+                matched_header = line_stripped
+                
+                # Clean up markdown prefixes (## Header -> Header)
+                if matched_header.startswith('#'):
+                    matched_header = matched_header.lstrip('#').strip()
+                
+                # Clean up the header
+                matched_header = matched_header.strip()
+                if len(matched_header) < 4:  # Too short to be a header
+                    continue
+                    
+                # Avoid false positives: line must be short enough to be a header
+                if len(matched_header) > 100:
+                    continue
+                    
+                is_header = True
+                
+                # Determine level
+                if level_override is not None:
+                    matched_level = level_override
+                elif line_stripped.startswith('#'):
+                    # Markdown: count # for level
+                    matched_level = len(line_stripped) - len(line_stripped.lstrip('#'))
+                break
+        
+        if is_header and matched_header:
+            # Save current section if it has content
+            if current_section["header"]:
+                sections.append(current_section)
+            
+            # Start new section
+            current_section = {
+                "header": matched_header,
+                "content": [],
+                "level": matched_level,
+            }
+        else:
+            current_section["content"].append(line)
+    
+    # Don't forget the last section
+    if current_section["header"]:
+        sections.append(current_section)
+    
+    # Need at least 3 sections for this to be useful
+    if len(sections) < 3:
+        logger.debug("pattern_based_headers_insufficient", found=len(sections))
+        return None
+    
+    logger.info("pattern_based_headers_detected", count=len(sections))
+    
+    # Build hierarchical tree from detected sections
+    root = DocumentNode(id="root", level=0, header=title)
+    total_nodes = 1
+    
+    # Track the last node at each level for proper nesting
+    level_stack: list[DocumentNode] = [root]
+    
+    for i, sec in enumerate(sections):
+        content = '\n'.join(sec["content"]).strip()
+        node = DocumentNode(
+            id=f"section_{i}",
+            level=sec["level"],
+            header=sec["header"],
+            content=content,
+        )
+        total_nodes += 1
+        
+        # Find the right parent: the most recent node with a lower level
+        while len(level_stack) > 1 and level_stack[-1].level >= sec["level"]:
+            level_stack.pop()
+        
+        # Add this node as a child of the appropriate parent
+        parent = level_stack[-1]
+        parent.children.append(node)
+        
+        # Push this node onto the stack in case it has children
+        level_stack.append(node)
+    
+    return DocumentTree(
+        title=title,
+        root=root,
+        total_nodes=total_nodes,
+        ingestion_tier=2,
+        ingestion_method="pattern_based_headers",
+    )
 
 
 def extract_raw_text(pdf_path: Path | str) -> str:
@@ -51,16 +197,16 @@ def try_semantic_splitter_ingestion(
     TIER 2 Fallback: Use semantic splitting for flat text documents.
     
     When Font Histogram detects no font variance, this method:
-    1. Extracts raw text from the PDF
-    2. Uses embedding-based splitting to find natural breaks
-    3. Generates synthetic section headers
+    1. First tries PATTERN-BASED header detection (regex for "1. HEADING", etc.)
+    2. If that fails, falls back to embedding-based semantic splitting
+    3. Generates synthetic section headers as last resort
     
     Args:
         pdf_path: Path to the PDF file.
         embed_provider: Embedding provider ("openai", "gemini", or None for auto).
         
     Returns:
-        DocumentTree with synthetic sections.
+        DocumentTree with detected or synthetic sections.
     """
     pdf_path = Path(pdf_path)
     
@@ -81,6 +227,24 @@ def try_semantic_splitter_ingestion(
             ingestion_method="semantic_splitter",
         )
     
+    # =========================================================================
+    # STEP 1: Try pattern-based header detection FIRST
+    # This catches "1. PARTIES AND RECITALS", "ARTICLE I:", etc.
+    # =========================================================================
+    pattern_tree = _try_pattern_based_headers(full_text, pdf_path.stem)
+    if pattern_tree:
+        logger.info(
+            "pattern_based_headers_success",
+            sections=pattern_tree.total_nodes - 1,
+            path=str(pdf_path),
+        )
+        return pattern_tree
+    
+    logger.debug("pattern_based_headers_failed_trying_semantic")
+    
+    # =========================================================================
+    # STEP 2: Fall back to semantic splitting
+    # =========================================================================
     # Try to import LlamaIndex components
     try:
         from llama_index.core import Document
@@ -191,8 +355,8 @@ def _build_tree_from_semantic_nodes(nodes: list, title: str) -> DocumentTree:
     
     # Helper to generate header (wrapped for potential parallelization later)
     # For now, we add logging so the user knows it's not frozen
-    def get_header(text, index):
-        h = _generate_synthetic_header(text)
+    def get_header(text: str, index: int) -> str:
+        h = _generate_synthetic_header(text, index)
         if h: 
             return h
         return f"Section {index}"
@@ -281,8 +445,8 @@ def _simple_chunk_fallback(text: str, title: str, chunk_size: int = 1000) -> Doc
     chunk_num = 0
 
     # Helper to generate header safely
-    def get_header(text, index):
-        h = _generate_synthetic_header(text)
+    def get_header(text: str, index: int) -> str:
+        h = _generate_synthetic_header(text, index)
         if h: 
             return h
         return f"Section {index}"

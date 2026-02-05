@@ -446,6 +446,10 @@ def _get_openai_llm(model: str, **kwargs: Any) -> Any:
             "Install with: pip install llama-index-llms-openai"
         )
     
+    # Set temperature=0 for deterministic outputs unless overridden
+    if "temperature" not in kwargs:
+        kwargs["temperature"] = 0.0
+    
     logger.debug("initializing_llm", provider="openai", model=model)
     return OpenAI(model=model, **kwargs)
 
@@ -459,6 +463,10 @@ def _get_anthropic_llm(model: str, **kwargs: Any) -> Any:
             "Anthropic LLM not installed. "
             "Install with: pip install llama-index-llms-anthropic"
         )
+    
+    # Set temperature=0 for deterministic outputs unless overridden
+    if "temperature" not in kwargs:
+        kwargs["temperature"] = 0.0
     
     logger.debug("initializing_llm", provider="anthropic", model=model)
     return Anthropic(model=model, **kwargs)
@@ -501,10 +509,14 @@ def _get_gemini_llm(model: str, **kwargs: Any) -> Any:
         class GeminiWrapper:
             """Wrapper for google-genai to match LlamaIndex LLM interface."""
             
-            def __init__(self, model_name: str, api_key: str):
+            def __init__(self, model_name: str, api_key: str, temperature: float = 0.0):
                 self.client = genai.Client(api_key=api_key)
                 self.model_name = model_name
                 self.fallback_model = "gemini-3-flash-preview"
+                # Temperature 0 for deterministic outputs
+                self.generation_config = types.GenerateContentConfig(
+                    temperature=temperature,
+                )
             
             @retry(
                 stop=stop_after_attempt(5),
@@ -513,10 +525,11 @@ def _get_gemini_llm(model: str, **kwargs: Any) -> Any:
             )
             def complete(self, prompt: str, **kw: Any) -> str:
                 try:
-                    # Try primary model first
+                    # Try primary model first with temperature=0 for determinism
                     response = self.client.models.generate_content(
                         model=self.model_name,
                         contents=prompt,
+                        config=self.generation_config,
                     )
                     return response.text or ""
                 except RETRY_EXCEPTIONS as e:
@@ -530,6 +543,7 @@ def _get_gemini_llm(model: str, **kwargs: Any) -> Any:
                     response = self.client.models.generate_content(
                         model=self.fallback_model,
                         contents=prompt,
+                        config=self.generation_config,
                     )
                     return response.text or ""
             
@@ -546,10 +560,11 @@ def _get_gemini_llm(model: str, **kwargs: Any) -> Any:
                     contents.append({"role": role, "parts": [{"text": msg.get("content", "")}]})
                 
                 try:
-                    # Try primary model first
+                    # Try primary model first with temperature=0 for determinism
                     response = self.client.models.generate_content(
                         model=self.model_name,
                         contents=contents,
+                        config=self.generation_config,
                     ) 
                     return response.text or ""
                 except RETRY_EXCEPTIONS as e:
@@ -563,6 +578,7 @@ def _get_gemini_llm(model: str, **kwargs: Any) -> Any:
                     response = self.client.models.generate_content(
                         model=self.fallback_model,
                         contents=contents,
+                        config=self.generation_config,
                     )
                     return response.text or ""
         

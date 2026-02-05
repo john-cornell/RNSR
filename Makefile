@@ -21,7 +21,8 @@ help:
 	@echo "  demo              Launch the Gradio web demo (http://localhost:7860)"
 	@echo "  demo-office       Run presentation-ready office demo (local only)"
 	@echo "  benchmark         Run performance benchmarks"
-	@echo "  benchmark-compare Compare RNSR vs Naive RAG vs Long Context"
+	@echo "  benchmark-compare Compare RNSR vs baselines (small doc)"
+	@echo "  benchmark-large   Compare on LARGE doc (shows RNSR advantage)"
 	@echo ""
 	@echo "Testing:"
 	@echo "  test          Run all tests"
@@ -79,12 +80,19 @@ benchmark-pdf:
 	@test -n "$(PDF)" || (echo "Error: PDF is required" && exit 1)
 	$(PYTHON) scripts/benchmark_demo.py --pdf $(PDF)
 
-# Compare RNSR vs Naive RAG vs Long Context
+# Compare RNSR vs Naive RAG vs Long Context (small document)
 benchmark-compare:
 	@echo "📊 Running Comparison Benchmark..."
 	@echo "   Comparing: RNSR vs Naive RAG vs Long Context LLM"
 	@echo ""
 	$(PYTHON) scripts/compare_benchmarks.py --quick
+
+# Compare on LARGE document (shows RNSR advantage when Long Context truncates)
+benchmark-large:
+	@echo "📊 Running LARGE Document Benchmark..."
+	@echo "   This demonstrates RNSR's advantage on documents too large for context"
+	@echo ""
+	$(PYTHON) scripts/compare_benchmarks.py --large
 
 # Compare with your own PDF
 benchmark-compare-pdf:

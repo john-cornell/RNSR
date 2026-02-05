@@ -297,6 +297,19 @@ class HeaderClassifier:
     H1_MIN_SIZE = 24.0
     H2_MIN_SIZE = 18.0
     H3_MIN_SIZE = 14.0
+    
+    # Font tolerance: minimum size difference to be considered a header
+    # This prevents slight font variations (e.g., figure captions) from creating new sections
+    FONT_TOLERANCE = 2.0  # points
+    
+    # Caption/figure patterns that should NOT be treated as section headers
+    CAPTION_PATTERNS = [
+        "figure", "fig.", "fig ", 
+        "table", "tab.", "tab ",
+        "chart", "diagram", "exhibit",
+        "graph", "image", "photo",
+        "note:", "notes:", "source:",
+    ]
 
     def __init__(
         self,
@@ -304,6 +317,7 @@ class HeaderClassifier:
         n_header_levels: int = 3,
         document_type: str | None = None,
         enable_threshold_learning: bool = True,
+        font_tolerance: float = 2.0,
     ):
         """
         Initialize the Header Classifier.
@@ -313,11 +327,13 @@ class HeaderClassifier:
             n_header_levels: Number of header levels to detect (default: 3).
             document_type: Optional document type for adaptive thresholds.
             enable_threshold_learning: Whether to learn thresholds from documents.
+            font_tolerance: Minimum size difference (pts) to consider as header.
         """
         self.use_clustering = use_clustering
         self.n_header_levels = n_header_levels
         self.document_type = document_type
         self.enable_threshold_learning = enable_threshold_learning
+        self.font_tolerance = font_tolerance
         
         # Get learned thresholds registry
         self._threshold_registry = get_learned_header_thresholds() if enable_threshold_learning else None
@@ -441,15 +457,52 @@ class HeaderClassifier:
         Determine if a span is a header candidate.
         
         A span is a header candidate if:
-        1. Font size > header_threshold, OR
-        2. Bold text at or above body size
+        1. Font size > header_threshold by at least font_tolerance, OR
+        2. Bold text significantly larger than body size
+        
+        A span is NOT a header candidate if:
+        1. Text matches caption patterns (Figure X, Table X, etc.)
+        2. Font size difference is within tolerance (noise)
         """
-        # Size-based detection
-        if span.font_size > analysis.header_threshold:
+        text_lower = span.text.lower().strip()
+        
+        # Skip caption-like text (Figure X, Table X, etc.)
+        if self._is_caption_text(text_lower):
+            return False
+        
+        # Require significant size difference (font tolerance)
+        size_above_threshold = span.font_size - analysis.header_threshold
+        size_above_body = span.font_size - analysis.body_size
+        
+        # Size-based detection with tolerance
+        if size_above_threshold >= self.font_tolerance:
             return True
         
-        # Bold text at body size or larger
-        if span.is_bold and span.font_size >= analysis.body_size:
+        # Bold text must be significantly larger than body (not just slightly bold)
+        if span.is_bold and size_above_body >= self.font_tolerance:
+            return True
+        
+        return False
+    
+    def _is_caption_text(self, text_lower: str) -> bool:
+        """
+        Check if text looks like a caption/label rather than a section header.
+        
+        Captions include: Figure X, Table X, Chart X, etc.
+        These should not create new tree nodes even if they have different fonts.
+        """
+        # Check for caption patterns at start of text
+        for pattern in self.CAPTION_PATTERNS:
+            if text_lower.startswith(pattern):
+                return True
+        
+        # Check for numeric-only or very short labels
+        clean_text = text_lower.strip()
+        if len(clean_text) < 3:
+            return True  # Too short to be a meaningful header
+        
+        # Check for patterns like "1." or "A)" which are list items, not headers
+        if len(clean_text) < 5 and any(c in clean_text for c in ".):"):
             return True
         
         return False
@@ -574,6 +627,7 @@ def classify_headers(
     spans: list[SpanInfo],
     analysis: FontAnalysis,
     use_clustering: bool = True,
+    font_tolerance: float = 2.0,
 ) -> list[ClassifiedSpan]:
     """
     Convenience function to classify spans into headers and body text.
@@ -582,6 +636,9 @@ def classify_headers(
         spans: List of SpanInfo from font analysis.
         analysis: FontAnalysis with body size and threshold.
         use_clustering: Whether to use k-means for header levels.
+        font_tolerance: Minimum size difference (pts) to be considered a header.
+            Higher values = fewer headers, less splitting.
+            Lower values = more headers, more granular tree.
         
     Returns:
         List of ClassifiedSpan with roles assigned.
@@ -591,5 +648,8 @@ def classify_headers(
         classified = classify_headers(spans, analysis)
         headers = [s for s in classified if s.role == "header"]
     """
-    classifier = HeaderClassifier(use_clustering=use_clustering)
+    classifier = HeaderClassifier(
+        use_clustering=use_clustering, 
+        font_tolerance=font_tolerance,
+    )
     return classifier.classify_spans(spans, analysis)

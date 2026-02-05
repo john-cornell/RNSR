@@ -1,0 +1,188 @@
+{
+  "document": "text_input",
+  "num_queries": 4,
+  "results": [
+    {
+      "method": "naive_rag",
+      "query": "Who are the parties to this contract?",
+      "answer": "Based on the context, the parties to this contract are:\n\n1.  **ACME TECHNOLOGIES INC.** (as indicated by the signature block)\n2.  The **Client**\n3.  The **Provider**",
+      "time_sec": 5.467634916305542,
+      "sources_used": 5,
+      "answer_relevance": 0.5,
+      "answer_correctness": 0.0,
+      "hallucination_score": 1.0,
+      "citation_accuracy": 0.0,
+      "tokens_used": 0,
+      "estimated_cost": 0.0
+    },
+    {
+      "method": "long_context",
+      "query": "Who are the parties to this contract?",
+      "answer": "The parties to this contract are Acme Technologies Inc. (\"Client\") and DataSoft Solutions LLC (\"Provider\").",
+      "time_sec": 1.7099599838256836,
+      "sources_used": 1,
+      "answer_relevance": 1.0,
+      "answer_correctness": 1.0,
+      "hallucination_score": 0.0,
+      "citation_accuracy": 0.0,
+      "tokens_used": 0,
+      "estimated_cost": 0.0
+    },
+    {
+      "method": "rnsr",
+      "query": "Who are the parties to this contract?",
+      "answer": "The parties to this contract are:\n*   **Client**: \"Acme Technologies Inc.\" (from section $N1_1_CLIENT_INFORMATION)\n*   **Provider**: \"DataSoft Solutions LLC\" (from section $N1_2_PROVIDER_INFORMATION)",
+      "time_sec": 11.797125816345215,
+      "sources_used": 0,
+      "answer_relevance": 1.0,
+      "answer_correctness": 1.0,
+      "hallucination_score": 0.0,
+      "citation_accuracy": 0.0,
+      "tokens_used": 0,
+      "estimated_cost": 0.0
+    },
+    {
+      "method": "naive_rag",
+      "query": "What is the total contract value?",
+      "answer": "The total contract value is **$750,000 USD**.",
+      "time_sec": 1.641753911972046,
+      "sources_used": 5,
+      "answer_relevance": 0.5,
+      "answer_correctness": 0.0,
+      "hallucination_score": 0.0,
+      "citation_accuracy": 0.0,
+      "tokens_used": 0,
+      "estimated_cost": 0.0
+    },
+    {
+      "method": "long_context",
+      "query": "What is the total contract value?",
+      "answer": "The total contract value is **$750,000 USD**.",
+      "time_sec": 1.3782267570495605,
+      "sources_used": 1,
+      "answer_relevance": 0.5,
+      "answer_correctness": 0.0,
+      "hallucination_score": 0.0,
+      "citation_accuracy": 0.0,
+      "tokens_used": 0,
+      "estimated_cost": 0.0
+    },
+    {
+      "method": "rnsr",
+      "query": "What is the total contract value?",
+      "answer": "The total contract value is \"$750,000 USD (Seven Hundred Fifty Thousand Dollars)\".",
+      "time_sec": 9.55680513381958,
+      "sources_used": 0,
+      "answer_relevance": 1.0,
+      "answer_correctness": 1.0,
+      "hallucination_score": 0.0,
+      "citation_accuracy": 0.0,
+      "tokens_used": 0,
+      "estimated_cost": 0.0
+    },
+    {
+      "method": "naive_rag",
+      "query": "What is the deliverable for Phase 1 and when is it due?",
+      "answer": "Based on the provided context:\n\n*   The due date for **Phase 1 Completion** is **March 15, 2024**.\n*   The specific deliverable for Phase 1 is not detailed in the provided \"Deliverables\" table, which is incomplete.",
+      "time_sec": 2.880425214767456,
+      "sources_used": 5,
+      "answer_relevance": 0.5,
+      "answer_correctness": 0.0,
+      "hallucination_score": 1.0,
+      "citation_accuracy": 0.0,
+      "tokens_used": 0,
+      "estimated_cost": 0.0
+    },
+    {
+      "method": "long_context",
+      "query": "What is the deliverable for Phase 1 and when is it due?",
+      "answer": "The deliverable for Phase 1 is **Requirements documentation**, and it is due on **February 28, 2024**.",
+      "time_sec": 2.531809091567993,
+      "sources_used": 1,
+      "answer_relevance": 1.0,
+      "answer_correctness": 1.0,
+      "hallucination_score": 0.0,
+      "citation_accuracy": 0.0,
+      "tokens_used": 0,
+      "estimated_cost": 0.0
+    },
+    {
+      "method": "rnsr",
+      "query": "What is the deliverable for Phase 1 and when is it due?",
+      "answer": "The deliverable for Phase 1 is \"Requirements documentation\" and it is due on \"February 28, 2024\".",
+      "time_sec": 9.529160261154175,
+      "sources_used": 0,
+      "answer_relevance": 1.0,
+      "answer_correctness": 1.0,
+      "hallucination_score": 0.0,
+      "citation_accuracy": 0.0,
+      "tokens_used": 0,
+      "estimated_cost": 0.0
+    },
+    {
+      "method": "naive_rag",
+      "query": "What are the termination conditions?",
+      "answer": "The termination conditions are as follows:\n\n**4.2 Termination for Convenience:**\n*   Either party may terminate with 60 days written notice.\n\n**4.3 Termination for Cause:**\nEither party may terminate immediately if the other party:\n*   Breaches a material term and fails to cure within 30 days.\n*   Becomes insolvent or files for bankruptcy.\n*   Engages in fraudulent conduct.",
+      "time_sec": 3.7807161808013916,
+      "sources_used": 5,
+      "answer_relevance": 1.0,
+      "answer_correctness": 1.0,
+      "hallucination_score": 0.0,
+      "citation_accuracy": 0.0,
+      "tokens_used": 0,
+      "estimated_cost": 0.0
+    },
+    {
+      "method": "long_context",
+      "query": "What are the termination conditions?",
+      "answer": "The agreement can be terminated under the following conditions:\n\n1.  **Initial Term Expiration:** The agreement naturally concludes on **September 30, 2024**.\n2.  **Termination for Convenience:** Either party may terminate the agreement with **60 days written notice**.\n3.  **Termination for Cause:** Either party may terminate immediately if the other party:\n    *   Breaches a material term and fails to cure it within **30 days**.\n    *   Becomes insolvent or files for bankruptcy.\n    *   Engages in fraudulent conduct.",
+      "time_sec": 4.230116128921509,
+      "sources_used": 1,
+      "answer_relevance": 1.0,
+      "answer_correctness": 1.0,
+      "hallucination_score": 0.0,
+      "citation_accuracy": 0.0,
+      "tokens_used": 0,
+      "estimated_cost": 0.0
+    },
+    {
+      "method": "rnsr",
+      "query": "What are the termination conditions?",
+      "answer": "The termination conditions are as follows:\n\n*   **Initial Term Expiration**: \"This Agreement commences on January 15, 2024 and continues until September 30, 2024.\"\n*   **Termination for Convenience**: \"Either party may terminate with 60 days written notice.\"\n*   **Termination for Cause**: Either party may terminate immediately if the other party:\n    *   \"Breaches a material term and fails to cure within 30 days\"\n    *   \"Becomes insolvent or files for bankruptcy\"\n    *   \"Engages in fraudulent conduct\"",
+      "time_sec": 15.979375839233398,
+      "sources_used": 0,
+      "answer_relevance": 1.0,
+      "answer_correctness": 1.0,
+      "hallucination_score": 0.0,
+      "citation_accuracy": 0.0,
+      "tokens_used": 0,
+      "estimated_cost": 0.0
+    }
+  ],
+  "summary": {
+    "rnsr": {
+      "avg_time_sec": 11.715616762638092,
+      "avg_relevance": 1.0,
+      "avg_correctness": 1.0,
+      "avg_hallucination": 0.0,
+      "total_sources": 0,
+      "num_queries": 4
+    },
+    "naive_rag": {
+      "avg_time_sec": 3.442632555961609,
+      "avg_relevance": 0.625,
+      "avg_correctness": 0.25,
+      "avg_hallucination": 0.5,
+      "total_sources": 20,
+      "num_queries": 4
+    },
+    "long_context": {
+      "avg_time_sec": 2.4625279903411865,
+      "avg_relevance": 0.875,
+      "avg_correctness": 0.75,
+      "avg_hallucination": 0.0,
+      "total_sources": 4,
+      "num_queries": 4
+    }
+  }
+}

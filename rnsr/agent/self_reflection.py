@@ -600,3 +600,245 @@ def reflect_on_answer(
     )
     
     return engine.reflect(answer, question, evidence)
+
+
+# =============================================================================
+# Strict Answer Verification (Critic Loop)
+# =============================================================================
+
+STRICT_VERIFICATION_PROMPT = """You are a HARSH CRITIC whose job is to find ANY unsupported claims in answers.
+
+QUESTION: {question}
+
+ANSWER TO VERIFY:
+{answer}
+
+SOURCE TEXT (the ONLY valid evidence):
+{sources}
+
+YOUR TASK:
+1. Extract EVERY factual claim from the answer
+2. For EACH claim, search the source text for supporting evidence
+3. If a claim is NOT DIRECTLY SUPPORTED by the source text, mark it as unsupported
+4. Do NOT accept inferences, deductions, or "reasonable assumptions" - only explicit statements count
+
+RULES:
+- Numbers must match exactly (or be correctly calculated from source data)
+- Names, dates, and specific facts must appear in the source text
+- General claims need specific supporting evidence
+- "Cannot determine" is an acceptable answer if the sources don't contain the information
+
+Respond in JSON:
+{{
+    "verified": true/false,
+    "claims_analyzed": [
+        {{
+            "claim": "The specific claim from the answer",
+            "supported": true/false,
+            "evidence": "Exact quote from source that supports this, or 'NOT FOUND'"
+        }}
+    ],
+    "unsupported_claims": ["List of claims that are NOT supported"],
+    "rejection_reason": "Why this answer should be rejected (if any)",
+    "confidence": 0.0-1.0
+}}"""
+
+
+@dataclass
+class VerificationResult:
+    """Result of strict answer verification."""
+    
+    verified: bool = False
+    claims_analyzed: list[dict[str, Any]] = field(default_factory=list)
+    unsupported_claims: list[str] = field(default_factory=list)
+    rejection_reason: str = ""
+    confidence: float = 0.0
+    raw_response: str = ""
+    
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "verified": self.verified,
+            "claims_analyzed": self.claims_analyzed,
+            "unsupported_claims": self.unsupported_claims,
+            "rejection_reason": self.rejection_reason,
+            "confidence": self.confidence,
+        }
+
+
+class StrictAnswerVerifier:
+    """
+    Harsh critic that tries to disprove answers.
+    
+    This implements the "Red Team" verification step that aggressively
+    looks for any claim in the answer that is NOT directly supported
+    by the source text.
+    
+    Key principle: An answer is guilty until proven innocent.
+    """
+    
+    def __init__(
+        self,
+        llm_fn: Callable[[str], str] | None = None,
+        max_unsupported_claims: int = 0,
+        min_verification_confidence: float = 0.7,
+    ):
+        """
+        Initialize the strict verifier.
+        
+        Args:
+            llm_fn: LLM function for verification.
+            max_unsupported_claims: Maximum unsupported claims allowed (0 = strict mode).
+            min_verification_confidence: Minimum confidence to accept verification result.
+        """
+        self.llm_fn = llm_fn
+        self.max_unsupported_claims = max_unsupported_claims
+        self.min_verification_confidence = min_verification_confidence
+    
+    def set_llm_function(self, llm_fn: Callable[[str], str]) -> None:
+        """Set the LLM function."""
+        self.llm_fn = llm_fn
+    
+    def verify(
+        self,
+        answer: str,
+        sources: str,
+        question: str = "",
+    ) -> VerificationResult:
+        """
+        Verify an answer against source text.
+        
+        Args:
+            answer: The answer to verify.
+            sources: The source text (evidence) to check against.
+            question: The original question (for context).
+            
+        Returns:
+            VerificationResult indicating if answer is verified or rejected.
+        """
+        if self.llm_fn is None:
+            logger.warning("no_llm_configured_for_strict_verification")
+            return VerificationResult(
+                verified=False,
+                rejection_reason="No LLM available for verification",
+            )
+        
+        # Handle "cannot determine" answers - these are acceptable
+        answer_lower = answer.lower().strip()
+        if any(phrase in answer_lower for phrase in [
+            "cannot answer",
+            "cannot determine",
+            "not found",
+            "i don't know",
+            "no information",
+            "not available",
+            "unable to find",
+        ]):
+            logger.info("answer_is_explicit_unknown", answer=answer[:100])
+            return VerificationResult(
+                verified=True,
+                confidence=1.0,
+                rejection_reason="",
+            )
+        
+        prompt = STRICT_VERIFICATION_PROMPT.format(
+            question=question,
+            answer=answer,
+            sources=sources[:8000] if sources else "No source text provided.",
+        )
+        
+        try:
+            response = self.llm_fn(prompt)
+            result = self._parse_verification(response)
+            
+            # Apply strict rules
+            if len(result.unsupported_claims) > self.max_unsupported_claims:
+                result.verified = False
+                if not result.rejection_reason:
+                    result.rejection_reason = f"Found {len(result.unsupported_claims)} unsupported claims"
+            
+            logger.info(
+                "strict_verification_complete",
+                verified=result.verified,
+                claims_count=len(result.claims_analyzed),
+                unsupported_count=len(result.unsupported_claims),
+                confidence=result.confidence,
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.warning("strict_verification_failed", error=str(e))
+            return VerificationResult(
+                verified=False,
+                rejection_reason=f"Verification failed: {str(e)}",
+            )
+    
+    def _parse_verification(self, response: str) -> VerificationResult:
+        """Parse verification response into structured format."""
+        result = VerificationResult(raw_response=response)
+        
+        try:
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if not json_match:
+                result.verified = False
+                result.rejection_reason = "Could not parse verification response"
+                return result
+            
+            data = json.loads(json_match.group())
+            
+            result.verified = data.get("verified", False)
+            result.claims_analyzed = data.get("claims_analyzed", [])
+            result.unsupported_claims = data.get("unsupported_claims", [])
+            result.rejection_reason = data.get("rejection_reason", "")
+            result.confidence = data.get("confidence", 0.5)
+            
+        except json.JSONDecodeError:
+            result.verified = False
+            result.rejection_reason = "Invalid JSON in verification response"
+        
+        return result
+
+
+def strict_verify_answer(
+    answer: str,
+    sources: str,
+    question: str = "",
+    llm_fn: Callable[[str], str] | None = None,
+    max_unsupported_claims: int = 0,
+) -> VerificationResult:
+    """
+    Strictly verify an answer against source text.
+    
+    This is the main entry point for the critic loop. It attempts to
+    disprove the answer by finding any claims not directly supported
+    by the source text.
+    
+    Args:
+        answer: The answer to verify.
+        sources: The source text (evidence).
+        question: The original question.
+        llm_fn: LLM function (uses default if not provided).
+        max_unsupported_claims: Max unsupported claims allowed (0 = strict).
+        
+    Returns:
+        VerificationResult with verified flag and rejection reason.
+    """
+    if llm_fn is None:
+        try:
+            from rnsr.llm import get_llm
+            llm = get_llm()
+            llm_fn = lambda p: str(llm.complete(p))
+        except Exception as e:
+            logger.warning("no_llm_available_for_verification", error=str(e))
+            return VerificationResult(
+                verified=False,
+                rejection_reason=f"No LLM available: {str(e)}",
+            )
+    
+    verifier = StrictAnswerVerifier(
+        llm_fn=llm_fn,
+        max_unsupported_claims=max_unsupported_claims,
+    )
+    
+    return verifier.verify(answer, sources, question)

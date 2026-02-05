@@ -161,6 +161,7 @@ class RetrievalTrace(BaseModel):
 IngestionMethod = Literal[
     "font_histogram",
     "semantic_splitter", 
+    "pattern_based_headers",  # Sub-tier of semantic: uses regex to detect headers
     "ocr",
     "xy_cut",
     "hierarchical_clustering",

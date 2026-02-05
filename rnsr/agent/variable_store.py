@@ -56,6 +56,56 @@ class VariableStore:
     # Pattern for valid pointer names: $UPPER_CASE_NAME
     POINTER_PATTERN = re.compile(r"^\$[A-Z][A-Z0-9_]*$")
     
+    @staticmethod
+    def sanitize_pointer(pointer: str) -> str:
+        """
+        Sanitize a pointer name to be valid.
+        
+        Converts invalid characters (periods, spaces, lowercase) to valid format.
+        
+        Args:
+            pointer: Raw pointer name (may be invalid)
+            
+        Returns:
+            Valid pointer name matching $UPPER_CASE_NAME pattern.
+            
+        Example:
+            sanitize_pointer("$SECTION_3.1_CONTENT") -> "$SECTION_3_1_CONTENT"
+            sanitize_pointer("section_name") -> "$SECTION_NAME"
+        """
+        # Ensure it starts with $
+        if not pointer.startswith("$"):
+            pointer = "$" + pointer
+        
+        # Convert to uppercase
+        pointer = pointer.upper()
+        
+        # Replace invalid characters with underscores
+        # Valid: A-Z, 0-9, _
+        sanitized = "$"
+        for char in pointer[1:]:  # Skip the $
+            if char.isalnum() or char == "_":
+                sanitized += char
+            else:
+                sanitized += "_"  # Replace periods, spaces, etc. with _
+        
+        # Remove consecutive underscores
+        while "__" in sanitized:
+            sanitized = sanitized.replace("__", "_")
+        
+        # Remove trailing underscores
+        sanitized = sanitized.rstrip("_")
+        
+        # Ensure it starts with a letter after $
+        if len(sanitized) > 1 and not sanitized[1].isalpha():
+            sanitized = "$X" + sanitized[1:]
+        
+        # Ensure minimum length
+        if len(sanitized) < 2:
+            sanitized = "$VAR"
+        
+        return sanitized
+    
     def __init__(self):
         """Initialize an empty variable store."""
         self._content: dict[str, str] = {}
@@ -87,11 +137,14 @@ class VariableStore:
         Example:
             store.assign("$PAYMENT_TERMS", "Payment due in 30 days...", "node_123")
         """
-        # Validate pointer format
+        # Sanitize pointer format (instead of raising error)
         if not self.POINTER_PATTERN.match(pointer):
-            raise AgentError(
-                f"Invalid pointer format: {pointer}. "
-                "Must match $UPPER_CASE_NAME pattern."
+            original = pointer
+            pointer = self.sanitize_pointer(pointer)
+            logger.debug(
+                "pointer_sanitized",
+                original=original,
+                sanitized=pointer,
             )
         
         # Generate content hash

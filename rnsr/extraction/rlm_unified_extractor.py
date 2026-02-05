@@ -78,19 +78,19 @@ relationships = []
 
 # Extract entities with exact text positions
 for match in re.finditer(r'pattern', SECTION_CONTENT):
-    entities.append({
+    entities.append({{
         "text": match.group(),
         "canonical_name": "Normalized Name",
         "type": "ENTITY_TYPE",
         "start": match.start(),
         "end": match.end(),
         "confidence": 0.9
-    })
+    }})
 
 # Extract relationships between entities
 # Look for patterns like "X is affiliated with Y", "X caused Y", etc.
 for match in re.finditer(r'(\w+)\s+(?:is|was)\s+(?:employed|hired)\s+by\s+(\w+)', SECTION_CONTENT):
-    relationships.append({
+    relationships.append({{
         "source_text": match.group(1),
         "target_text": match.group(2),
         "type": "AFFILIATED_WITH",
@@ -98,7 +98,7 @@ for match in re.finditer(r'(\w+)\s+(?:is|was)\s+(?:employed|hired)\s+by\s+(\w+)'
         "start": match.start(),
         "end": match.end(),
         "confidence": 0.85
-    })
+    }})
 
 store_variable("ENTITIES", entities)
 store_variable("RELATIONSHIPS", relationships)

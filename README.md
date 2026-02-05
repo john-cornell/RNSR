@@ -269,17 +269,79 @@ Document → LLM writes code → Execute on DOC_VAR → ToT validation → Cross
                             All tied to exact text spans
 ```
 
+### RLM Navigation Architecture (ToT + REPL Integration)
+
+RNSR uses a unique combination of Tree of Thoughts (ToT) reasoning and a REPL (Read-Eval-Print Loop) environment for document navigation. This is what sets RNSR apart from naive RAG approaches:
+
+**The Problem with Naive RAG:**
+Traditional RAG splits documents into chunks, embeds them, and retrieves based on similarity. This loses hierarchical structure and often retrieves irrelevant chunks for complex queries.
+
+**RNSR's RLM Navigation Solution:**
+
+```
+Query → NavigationREPL → LLM Generates Code → Execute → Findings → ToT Validation → Answer
+           ↓                    ↓                ↓          ↓            ↓
+    Expose document       search_tree()      Find relevant  Store     Verify with
+    as environment        navigate_to()      nodes          findings  probabilities
+                          get_content()
+```
+
+**How it works:**
+
+1. **Document as Environment**: The document tree is exposed as a programmable environment through `NavigationREPL`. The LLM can write Python code to search, navigate, and extract information.
+
+2. **Code Generation Navigation**: Instead of keyword matching, the LLM writes code like:
+   ```python
+   # LLM-generated code to find CEO salary
+   results = search_tree(r"CEO|chief executive|compensation|salary")
+   for match in results[:3]:
+       navigate_to(match.node_id)
+       content = get_node_content(match.node_id)
+       if "salary" in content.lower():
+           store_finding("ceo_salary", content, match.node_id)
+   ready_to_synthesize()
+   ```
+
+3. **Iterative Search**: The LLM can execute multiple rounds of code, drilling deeper into promising sections, just like a human would browse a document.
+
+4. **ToT Validation**: Findings are validated using Tree of Thoughts - each potential answer gets a probability score based on how well it matches the query and document evidence.
+
+5. **Grounded Answers**: All answers are tied to specific document sections. If the LLM can't find reliable information, it honestly reports "Unable to find reliable information" rather than hallucinating.
+
+**Available NavigationREPL Functions:**
+
+| Function | Description |
+|----------|-------------|
+| `search_content(pattern)` | Regex search within current node |
+| `search_children(pattern)` | Search direct children |
+| `search_tree(pattern)` | Search entire subtree with relevance scoring |
+| `navigate_to(node_id)` | Move to a specific section |
+| `go_back()` | Return to previous section |
+| `go_to_root()` | Return to document root |
+| `get_node_content(node_id)` | Get full text of a section |
+| `store_finding(key, content, node_id)` | Save relevant information |
+| `ready_to_synthesize()` | Signal that enough info has been gathered |
+
+**Why This Outperforms Naive RAG:**
+
+- **Hierarchical Understanding**: RNSR understands that "Section 42" might contain the CEO salary even if the query doesn't mention "Section 42"
+- **Multi-hop Reasoning**: Can navigate from a table of contents to a specific subsection to find buried information
+- **Document Length Agnostic**: Works equally well on 10-page and 1000-page documents - the LLM navigates to relevant sections rather than trying to fit everything in context
+- **No Hallucination**: If information isn't found through code execution, the system admits it rather than making up answers
+
 ## Architecture
 
 ```
 rnsr/
 ├── agent/                   # Query processing
-│   ├── rlm_navigator.py     # Main navigation agent
-│   ├── provenance.py        # Citation tracking (NEW)
-│   ├── llm_cache.py         # Response caching (NEW)
-│   ├── self_reflection.py   # Answer improvement (NEW)
-│   ├── reasoning_memory.py  # Chain memory (NEW)
-│   ├── query_clarifier.py   # Ambiguity handling (NEW)
+│   ├── rlm_navigator.py     # Main navigation agent (RLM + ToT)
+│   ├── nav_repl.py          # NavigationREPL for code-based navigation (NEW)
+│   ├── repl_env.py          # Base REPL environment
+│   ├── provenance.py        # Citation tracking
+│   ├── llm_cache.py         # Response caching
+│   ├── self_reflection.py   # Answer improvement
+│   ├── reasoning_memory.py  # Chain memory
+│   ├── query_clarifier.py   # Ambiguity handling
 │   ├── graph.py             # LangGraph workflow
 │   └── variable_store.py    # Context management
 ├── extraction/              # Entity/relationship extraction

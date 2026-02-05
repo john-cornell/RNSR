@@ -34,6 +34,8 @@ from typing import Any, Callable, Literal
 import structlog
 
 from rnsr.agent.variable_store import VariableStore, generate_pointer_name
+from rnsr.agent.nav_repl import NavigationREPL, create_navigation_repl
+from rnsr.agent.self_reflection import strict_verify_answer, VerificationResult
 from rnsr.indexing.kv_store import KVStore
 from rnsr.models import SkeletonNode, TraceEntry
 
@@ -605,6 +607,17 @@ class RLMConfig:
     # Vision mode
     enable_vision: bool = False  # Use vision LLM for page images
     vision_model: str = "gemini-2.5-flash"  # Vision model to use
+    
+    # RLM Navigation Mode (LLM writes code to search document)
+    use_rlm_navigation: bool = True  # Use LLM code generation for navigation
+    rlm_max_search_iterations: int = 10  # Max code generation iterations per navigation
+    rlm_search_depth: int = 3  # How many levels deep to search in one iteration
+    rlm_min_content_length: int = 50  # Minimum useful content length
+    rlm_max_content_for_specific: int = 3000  # Content longer than this suggests broad section
+    
+    # Minimum exploration requirements (prevents premature synthesis)
+    min_nodes_to_visit: int = 2  # Minimum nodes to visit before allowing synthesis
+    min_findings_required: int = 1  # Minimum findings before synthesis allowed (quality > quantity)
 
 
 # =============================================================================
@@ -1046,19 +1059,21 @@ Respond ONLY with JSON:"""
                 return result
             else:
                 logger.warning("verification_json_parse_failed", response=response[:200])
+                # Default to INVALID when we can't parse - don't assume valid
                 return {
-                    "is_valid": True,
-                    "confidence": 0.5,
-                    "issues": ["Could not parse verification response"],
+                    "is_valid": False,
+                    "confidence": 0.2,
+                    "issues": ["Could not parse verification response - treating as unverified"],
                     "improved_answer": proposed_answer,
                 }
                 
         except Exception as e:
             logger.error("verification_failed", error=str(e))
+            # Default to INVALID on errors - don't assume valid
             return {
-                "is_valid": True,
-                "confidence": 0.3,
-                "issues": [str(e)],
+                "is_valid": False,
+                "confidence": 0.1,
+                "issues": [f"Verification failed: {str(e)}"],
                 "improved_answer": proposed_answer,
             }
 
@@ -1186,6 +1201,9 @@ class RLMNavigator:
         self.verification_engine = AnswerVerificationEngine(self.config)
         self.entity_decomposer = EntityAwareDecomposer(knowledge_graph)
         
+        # NavigationREPL for RLM-style code generation navigation
+        self.nav_repl = create_navigation_repl(skeleton, kv_store)
+        
         # LLM function
         self._llm_fn: Callable[[str], str] | None = None
         
@@ -1205,6 +1223,7 @@ class RLMNavigator:
         self.recursive_engine.set_llm_function(llm_fn)
         self.verification_engine.set_llm_function(llm_fn)
         self.entity_decomposer.set_llm_function(llm_fn)
+        self.nav_repl.set_llm_function(llm_fn)
     
     def set_knowledge_graph(self, kg) -> None:
         """Set the knowledge graph for entity-aware decomposition."""
@@ -1304,6 +1323,14 @@ class RLMNavigator:
             search_text = f"{node.header} {node.summary}".lower()
             matched_keywords = [kw for kw in keywords if kw in search_text]
             state.pre_filtered_nodes[node.node_id] = matched_keywords
+        
+        # DON'T hard-restrict allowed nodes based on keyword pre-filter
+        # The LLM-generated search patterns will find relevant sections
+        # that don't match simple keywords (e.g., "Client Information" 
+        # when searching for "parties")
+        # 
+        # Pre-filter is used for PRIORITIZATION, not hard blocking
+        self.nav_repl.set_allowed_nodes(None)  # Allow searching all nodes
         
         state.add_trace(
             "pre_filter",
@@ -1511,8 +1538,28 @@ Respond with JSON only:"""
         return state
     
     def _do_traverse(self, state: RLMAgentState, node: SkeletonNode) -> RLMAgentState:
-        """Traverse to children using ToT with pre-filtering."""
-        # Get children
+        """Traverse to children using deterministic navigation with pre-filtering."""
+        # Use deterministic navigation based on pre-filter results
+        if self.config.use_rlm_navigation and self._llm_fn:
+            # First try deterministic navigation using search results
+            state = self._deterministic_navigate(state)
+            
+            # Check if we got good results
+            if state.variables and len(state.variables) > 0:
+                state.visited_nodes.append(node.node_id)
+                state.current_node_id = None
+                return state
+            
+            # Fallback to RLM code generation if deterministic failed
+            logger.info("deterministic_nav_failed_fallback_to_rlm")
+            self.nav_repl._navigate_to(node.node_id)
+            state = self._rlm_navigate(state)
+            
+            state.visited_nodes.append(node.node_id)
+            state.current_node_id = None
+            return state
+        
+        # Fallback: Traditional ToT with keyword pre-filtering
         children = [self.skeleton.get(cid) for cid in node.child_ids]
         children = [c for c in children if c is not None]
         
@@ -1553,6 +1600,625 @@ Respond with JSON only:"""
         state.visited_nodes.append(node.node_id)
         state.current_node_id = None
         return state
+    
+    def _llm_generate_search_patterns(self, query: str) -> list[str]:
+        """
+        Use LLM to generate intelligent search patterns for a query.
+        
+        The LLM understands the semantic intent and generates patterns that
+        will find relevant sections, including related terms the user didn't
+        explicitly mention.
+        
+        Returns a list of regex patterns to search the document.
+        """
+        if not self._llm_fn:
+            return []
+        
+        prompt = f"""You are a document search expert. Given a user query, generate SIMPLE regex search patterns that will find ALL relevant sections.
+
+USER QUERY: {query}
+
+CRITICAL: Generate SIMPLE patterns that match document section headers and content.
+Use only basic regex: word1|word2|word3 format with (?i) prefix for case-insensitive.
+
+Examples of GOOD patterns:
+- (?i)(parties|client|provider|company|inc|llc)
+- (?i)(termination|term|expire|end|cancel)
+- (?i)(payment|price|cost|fee|amount|value)
+- (?i)(deliverable|phase|milestone|due date)
+
+Examples of BAD patterns (too complex, won't match):
+- (?i)(?:parties|agreement).*?(?:between|to)
+- (?i)(\\w+)\\s+(?:shall|must)
+
+Think about:
+1. What words appear in section HEADERS? (e.g., "Client Information", "Provider Details")
+2. What synonyms and related terms exist?
+3. What proper nouns might appear? (company names, people)
+
+Generate 2-3 SIMPLE patterns, one per line:"""
+
+        try:
+            response = self._llm_fn(prompt)
+            patterns = []
+            for line in response.strip().split('\n'):
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    # Clean up the pattern
+                    if line.startswith('```'):
+                        continue
+                    # Remove quotes if present
+                    line = line.strip('"\'`')
+                    if line:
+                        patterns.append(line)
+            
+            logger.info(
+                "llm_search_patterns_generated",
+                query=query,
+                patterns=patterns[:5],
+            )
+            return patterns[:5]  # Max 5 patterns
+        except Exception as e:
+            logger.warning("llm_pattern_generation_failed", error=str(e))
+            return []
+    
+    def _deterministic_navigate(self, state: RLMAgentState) -> RLMAgentState:
+        """
+        Hybrid navigation: LLM generates search patterns, ToT executes them.
+        
+        Flow:
+        1. LLM generates intelligent search patterns (semantic understanding)
+        2. Patterns are executed against ToT (deterministic search)
+        3. Content is extracted directly from found nodes (no hallucination)
+        
+        This combines LLM intelligence for query understanding with
+        deterministic execution for reliability.
+        """
+        query = state.current_sub_question or state.question
+        keywords = state.extracted_keywords or []
+        
+        logger.info(
+            "deterministic_nav_start",
+            query=query,
+            keywords=keywords,
+        )
+        
+        # Reset REPL state
+        self.nav_repl.reset()
+        self.nav_repl.set_query(query)
+        
+        # Step 1: Use LLM to generate intelligent search patterns
+        llm_patterns = self._llm_generate_search_patterns(query)
+        
+        # Step 2: Combine LLM patterns with keyword-based patterns as fallback
+        all_patterns = []
+        
+        # Add LLM-generated patterns first (higher quality)
+        all_patterns.extend(llm_patterns)
+        
+        # Add keyword-based pattern as fallback
+        if keywords:
+            keyword_pattern = r'(?i)(' + '|'.join(re.escape(k) for k in keywords if len(k) > 2) + ')'
+            all_patterns.append(keyword_pattern)
+        else:
+            query_words = [w for w in query.lower().split() if len(w) > 3]
+            if query_words:
+                word_pattern = r'(?i)(' + '|'.join(re.escape(w) for w in query_words) + ')'
+                all_patterns.append(word_pattern)
+        
+        if not all_patterns:
+            logger.warning("deterministic_nav_no_patterns")
+            return state
+        
+        # Step 3: Execute all patterns and collect unique results
+        all_results = {}  # node_id -> result (dedup)
+        for pattern in all_patterns:
+            try:
+                search_results = self.nav_repl._search_tree(pattern, max_depth=5)
+                for result in search_results:
+                    node_id = result["node_id"]
+                    # Keep highest score for each node
+                    if node_id not in all_results or result["score"] > all_results[node_id]["score"]:
+                        all_results[node_id] = result
+            except Exception as e:
+                logger.warning("pattern_search_failed", pattern=pattern, error=str(e))
+                continue
+        
+        # Convert back to sorted list
+        search_results = sorted(all_results.values(), key=lambda x: x["score"], reverse=True)
+        
+        if not search_results:
+            logger.warning("deterministic_nav_no_results", pattern=pattern)
+            return state
+        
+        # Step 4: Include sibling sections for context completeness
+        # If we found section 4.2 and 4.3, also include 4.1 (same parent)
+        sibling_results = {}
+        for result in search_results[:5]:  # Check top 5 matches
+            node_id = result["node_id"]
+            node = self.skeleton.get(node_id)
+            if node and node.parent_id:
+                parent = self.skeleton.get(node.parent_id)
+                if parent:
+                    # Add all siblings of matched nodes
+                    for sibling_id in parent.child_ids:
+                        if sibling_id not in all_results and sibling_id not in sibling_results:
+                            sibling_node = self.skeleton.get(sibling_id)
+                            if sibling_node:
+                                sibling_results[sibling_id] = {
+                                    "node_id": sibling_id,
+                                    "header": sibling_node.header,
+                                    "level": sibling_node.level,
+                                    "depth_from_current": 0,
+                                    "matches": 0,
+                                    "score": result["score"] * 0.5,  # Lower score for siblings
+                                    "path": [],
+                                    "is_sibling": True,
+                                }
+        
+        # Add siblings to results
+        if sibling_results:
+            logger.info(
+                "sibling_sections_added",
+                count=len(sibling_results),
+                siblings=[r["header"] for r in sibling_results.values()],
+            )
+            all_results.update(sibling_results)
+            search_results = sorted(all_results.values(), key=lambda x: x["score"], reverse=True)
+        
+        # Log what we found
+        logger.info(
+            "deterministic_nav_search_results",
+            num_results=len(search_results),
+            top_results=[(r["header"], r["score"], r["node_id"]) for r in search_results[:5]],
+        )
+        
+        # Take top-ranked sections - use higher limit to include siblings
+        # We process more candidates but limit actual findings stored
+        max_candidates = max(self.config.top_k * 2, 10)  # At least 10 candidates
+        top_sections = search_results[:max_candidates]
+        
+        findings_stored = 0
+        max_findings = 5  # Allow more findings to include siblings
+        for result in top_sections:
+            node_id = result["node_id"]
+            header = result["header"]
+            score = result["score"]
+            is_sibling = result.get("is_sibling", False)
+            
+            # Skip relevance validation for sibling sections (included for context)
+            if not is_sibling:
+                # Validate relevance: check that section header or content matches query intent
+                if not self._validate_section_relevance(query, keywords, result):
+                    logger.debug(
+                        "section_relevance_rejected",
+                        node_id=node_id,
+                        header=header,
+                        reason="low relevance to query",
+                    )
+                    continue
+            
+            # Get full content directly from kv_store (no LLM involved)
+            content = self.nav_repl.kv_store.get(node_id) or ""
+            
+            # For sibling sections, use lower content threshold (they provide context)
+            min_length = 20 if is_sibling else self.config.rlm_min_content_length
+            if not content or len(content) < min_length:
+                logger.debug(
+                    "section_skipped_short_content",
+                    node_id=node_id,
+                    header=header,
+                    content_length=len(content),
+                    min_required=min_length,
+                )
+                continue
+            
+            # Create pointer name
+            pointer_name = generate_pointer_name(header)
+            findings_stored += 1
+            
+            # Store DIRECTLY in navigator's variable_store (not REPL's)
+            self.variable_store.assign(pointer_name, content, node_id)
+            
+            # Track in state
+            if node_id not in state.visited_nodes:
+                state.visited_nodes.append(node_id)
+            if pointer_name not in state.variables:
+                state.variables.append(pointer_name)
+                state.context += f"\n{pointer_name}: {content[:500]}"
+            
+            logger.info(
+                "deterministic_finding_stored",
+                pointer=pointer_name,
+                node_id=node_id,
+                header=header,
+                score=score,
+                content_length=len(content),
+            )
+            
+            # Stop after finding enough relevant sections
+            if findings_stored >= max_findings:
+                break
+        
+        logger.info(
+            "deterministic_nav_complete",
+            findings_stored=findings_stored,
+            variables=state.variables,
+        )
+        
+        return state
+    
+    def _validate_section_relevance(
+        self, 
+        query: str, 
+        keywords: list[str], 
+        search_result: dict
+    ) -> bool:
+        """
+        Validate that a section is actually relevant to the query.
+        
+        This prevents storing content from irrelevant sections just because
+        they matched a keyword tangentially.
+        """
+        header = search_result.get("header", "").lower()
+        node_id = search_result.get("node_id", "")
+        score = search_result.get("score", 0)
+        
+        # High score sections are likely relevant
+        if score >= 10.0:
+            return True
+        
+        # Check if query terms appear in header (strong signal)
+        query_lower = query.lower()
+        query_words = [w for w in query_lower.split() if len(w) > 3]
+        header_matches = sum(1 for w in query_words if w in header)
+        
+        if header_matches >= 2:
+            return True
+        
+        # Check if keywords match header
+        keyword_matches = sum(1 for k in keywords if k.lower() in header)
+        if keyword_matches >= 1:
+            return True
+        
+        # Check content for keyword density
+        content = self.nav_repl.kv_store.get(node_id) or ""
+        if content:
+            content_lower = content.lower()
+            keyword_count = sum(content_lower.count(k.lower()) for k in keywords if k)
+            # Require reasonable keyword density
+            if keyword_count >= 2:
+                return True
+        
+        # Low relevance
+        return False
+    
+    def _rlm_navigate(self, state: RLMAgentState) -> RLMAgentState:
+        """
+        RLM-style navigation: LLM writes Python code to search the document.
+        
+        Instead of keyword matching, the LLM generates search code that:
+        1. Uses regex patterns to find relevant content
+        2. Navigates the document tree programmatically
+        3. Stores findings as it discovers them
+        4. Signals when ready to synthesize an answer
+        
+        This is the core RLM pattern - treating the document as an environment
+        the LLM can explore through code execution.
+        """
+        if not self._llm_fn:
+            logger.warning("No LLM function set for RLM navigation")
+            return state
+        
+        # Reset and configure NavigationREPL
+        self.nav_repl.reset()
+        self.nav_repl.set_query(state.current_sub_question or state.question)
+        
+        # Get the system prompt
+        system_prompt = self.nav_repl.get_system_prompt()
+        
+        state.add_trace(
+            "rlm_navigation",
+            "Starting RLM navigation with code generation",
+            {"query": state.question, "max_iterations": self.config.rlm_max_search_iterations},
+        )
+        
+        # Track errors for feedback to LLM
+        last_error = None
+        last_code = None
+        
+        # Iterative code generation loop
+        for iteration in range(self.config.rlm_max_search_iterations):
+            # Get current REPL state
+            repl_state = self.nav_repl.get_state()
+            current_node = self.skeleton.get(repl_state["current_node_id"])
+            
+            # Log iteration start with full state
+            logger.info(
+                "rlm_iteration_start",
+                iteration=iteration,
+                current_node=current_node.header if current_node else "root",
+                current_node_id=repl_state["current_node_id"],
+                findings_count=len(repl_state.get("findings", [])),
+                visited_nodes=len(state.visited_nodes),
+                nav_history=len(repl_state.get("navigation_history", [])),
+            )
+            
+            # Build error feedback if there was an error
+            error_feedback = ""
+            if last_error:
+                error_feedback = f"""
+PREVIOUS ERROR: Your last code failed:
+```python
+{last_code[:300] if last_code else ""}
+```
+Error: {last_error}
+
+FIX REQUIRED:
+1. ALWAYS define variables before using them
+2. Correct pattern: `matches = search_tree(pattern)` THEN `if matches:`
+3. Do NOT reference 'matches' unless you just called search_tree/search_children
+4. Try again with COMPLETE, working code
+"""
+            
+            # Check if current findings are too broad and provide guidance
+            broad_content_guidance = ""
+            findings = repl_state.get("findings", [])
+            if findings:
+                # Check if any findings are from broad sections
+                for finding in findings:
+                    source_id = finding.get("source_node_id", "")
+                    source_node = self.skeleton.get(source_id)
+                    if source_node:
+                        content = self.nav_repl.kv_store.get(source_id) or ""
+                        if len(content) > self.config.rlm_max_content_for_specific:
+                            broad_content_guidance = f"""
+NOTE: You stored content from '{source_node.header}' which is a BROAD section ({len(content)} chars).
+This section likely contains everything but isn't specific enough.
+TRY: Navigate to its children for more focused content, or search within this section.
+"""
+                            break
+            
+            # If no findings yet and we've done iterations, encourage persistence
+            persistence_guidance = ""
+            if iteration > 0 and not findings:
+                persistence_guidance = """
+NOTE: No findings stored yet. Keep searching!
+- Try different search patterns (synonyms, related terms)
+- Search children of sections that had matches
+- Look for sections with matching HEADERS (more specific than content matches)
+"""
+            
+            # Build prompt for code generation
+            code_gen_prompt = f"""{system_prompt}
+
+CURRENT STATE:
+- Location: {current_node.header if current_node else "root"}
+- Children: {len(current_node.child_ids) if current_node else 0} sections
+- Findings so far: {len(findings)}
+- Navigation history: {len(repl_state.get("navigation_history", []))} moves
+- Iteration: {iteration + 1} of {self.config.rlm_max_search_iterations}
+{error_feedback}{broad_content_guidance}{persistence_guidance}
+QUERY: {state.current_sub_question or state.question}
+
+Your task: Write Python code to search for information relevant to the query.
+Use the available functions to search content, navigate to relevant sections, 
+and store important findings.
+
+IMPORTANT:
+- Write COMPLETE Python code - define all variables before using them
+- Use search_tree() or search_children() to find relevant sections
+- ALWAYS assign the result to a variable: `matches = search_tree(...)`
+- Results are sorted by SCORE - higher scores mean MORE SPECIFIC sections
+- PREFER sections with header matches over content-only matches
+- If a section has children, DRILL DOWN into them for more specific content
+- Use navigate_to() to move to promising sections  
+- Use get_current_content() after navigating to get full text
+- Use store_finding() when you find relevant information
+- Call ready_to_synthesize() when you have enough information
+- Keep searching until you find SPECIFIC content that answers the query
+
+Generate Python code only, no explanations:
+```python
+"""
+            
+            try:
+                response = self._llm_fn(code_gen_prompt)
+                
+                # Extract code from response
+                code = self._extract_code_from_response(response)
+                
+                # Log the generated code (full code for debugging)
+                logger.info(
+                    "rlm_code_generated",
+                    iteration=iteration,
+                    code_length=len(code) if code else 0,
+                    code_full=code if code and len(code) < 2000 else (code[:1000] + "... [truncated]" if code else "None"),
+                )
+                
+                if not code:
+                    logger.warning(f"RLM iteration {iteration}: No code generated")
+                    state.add_trace(
+                        "rlm_navigation",
+                        f"Iteration {iteration}: No code generated",
+                        {"response_preview": response[:200]},
+                    )
+                    last_error = "No valid Python code was generated"
+                    last_code = response[:200]
+                    continue
+                
+                # Execute the code
+                exec_result = self.nav_repl.execute(code)
+                
+                # Log execution result in detail
+                logger.info(
+                    "rlm_code_executed",
+                    iteration=iteration,
+                    success=exec_result.get("success", False),
+                    error=exec_result.get("error"),
+                    output_preview=str(exec_result.get("output", ""))[:200],
+                    current_node=exec_result.get("current_node"),
+                    findings_count=exec_result.get("findings_count", 0),
+                )
+                
+                # Track code and any errors for next iteration
+                last_code = code
+                if exec_result.get("error"):
+                    last_error = exec_result["error"]
+                else:
+                    last_error = None  # Clear error on success
+                
+                state.add_trace(
+                    "rlm_navigation",
+                    f"Iteration {iteration}: Code executed",
+                    {
+                        "code_preview": code[:200],
+                        "output_preview": str(exec_result.get("output", ""))[:200],
+                        "error": exec_result.get("error"),
+                    },
+                )
+                
+                # Sync REPL navigation with state.visited_nodes
+                # Include both navigation_history (previous nodes) and current location
+                repl_state = self.nav_repl.get_state()
+                current_loc = repl_state.get("current_node_id", "")
+                if current_loc and current_loc not in state.visited_nodes:
+                    state.visited_nodes.append(current_loc)
+                for visited_id in repl_state.get("navigation_history", []):
+                    if visited_id not in state.visited_nodes:
+                        state.visited_nodes.append(visited_id)
+                
+                # Check if ready to synthesize
+                # BUT don't allow early exit if there are no findings and there was an error
+                if self.nav_repl.is_ready_to_synthesize():
+                    findings_count = len(self.nav_repl._get_findings())
+                    nodes_visited = len(state.visited_nodes)
+                    
+                    # Don't allow premature exit if no findings and had errors
+                    if findings_count == 0 and last_error:
+                        logger.warning(
+                            "ignoring_premature_ready",
+                            reason="No findings stored but had errors",
+                            iteration=iteration,
+                        )
+                        # Reset the flag and continue searching
+                        self.nav_repl._ready_to_synthesize = False
+                        continue
+                    
+                    # Don't allow exit on first iteration if no findings (likely incomplete)
+                    if findings_count == 0 and iteration == 0:
+                        logger.warning(
+                            "ignoring_premature_ready",
+                            reason="No findings on first iteration",
+                        )
+                        self.nav_repl._ready_to_synthesize = False
+                        continue
+                    
+                    # Enforce minimum exploration requirements
+                    # Primary requirement: must have enough findings
+                    # Secondary: if no findings yet, must explore more nodes
+                    needs_more_findings = findings_count < self.config.min_findings_required
+                    needs_more_nodes = findings_count == 0 and nodes_visited < self.config.min_nodes_to_visit
+                    
+                    if needs_more_findings or needs_more_nodes:
+                        logger.debug(
+                            "forcing_more_exploration",
+                            nodes=nodes_visited,
+                            min_nodes=self.config.min_nodes_to_visit,
+                            findings=findings_count,
+                            min_findings=self.config.min_findings_required,
+                        )
+                        self.nav_repl._ready_to_synthesize = False
+                        continue
+                    
+                    logger.info(f"RLM navigation complete after {iteration + 1} iterations")
+                    break
+                    
+            except Exception as e:
+                logger.error(f"RLM navigation error: {e}")
+                state.add_trace("rlm_navigation", f"Error: {str(e)}", {})
+                last_error = str(e)
+                last_code = code if 'code' in dir() else None
+        
+        # Process findings into state
+        # findings is a list of dicts: [{"name": ..., "content": ..., "source_node_id": ...}, ...]
+        findings = self.nav_repl._get_findings()
+        
+        if findings:
+            state.add_trace(
+                "rlm_navigation",
+                f"Found {len(findings)} relevant pieces of information",
+                {"finding_names": [f.get("name", "") for f in findings]},
+            )
+            
+            # Add findings to context and variables
+            # NOTE: nav_repl._store_finding() already stores FULL content in variable_store
+            # The findings list only contains a truncated preview - do NOT overwrite!
+            for finding in findings:
+                name = finding.get("name", "")
+                node_id = finding.get("source_node_id")
+                
+                # The pointer name is already correct from nav_repl
+                pointer = name if name.startswith("$") else generate_pointer_name(name)
+                
+                # Add pointer to variables if not already added (node may already be in visited_nodes)
+                if pointer not in state.variables:
+                    state.variables.append(pointer)
+                    
+                    # Also ensure node is in visited_nodes
+                    if node_id and node_id not in state.visited_nodes:
+                        state.visited_nodes.append(node_id)
+                    
+                    # Get FULL content from variable_store (already stored by nav_repl)
+                    # Do NOT use finding.get("content") - that's truncated!
+                    full_content = self.variable_store.resolve(pointer)
+                    if not full_content:
+                        # Fallback: get directly from kv_store
+                        full_content = self.nav_repl.kv_store.get(node_id) or ""
+                        if full_content:
+                            self.variable_store.assign(pointer, full_content, node_id)
+                    
+                    # Add preview to context for synthesis prompt
+                    preview = full_content[:500] if full_content else finding.get("content", "")
+                    state.context += f"\n{pointer}: {preview}"
+                    
+                    logger.info(
+                        "variable_assigned",
+                        pointer=pointer,
+                        chars=len(full_content) if full_content else 0,
+                        source=node_id,
+                    )
+        else:
+            state.add_trace(
+                "rlm_navigation",
+                "No findings from RLM navigation",
+                {},
+            )
+        
+        return state
+    
+    def _extract_code_from_response(self, response: str) -> str:
+        """Extract Python code from LLM response."""
+        # Try to find code block
+        code_match = re.search(r"```(?:python)?\s*(.*?)```", response, re.DOTALL)
+        if code_match:
+            return code_match.group(1).strip()
+        
+        # If no code block, try to find code-like content
+        lines = response.strip().split("\n")
+        code_lines = []
+        in_code = False
+        
+        for line in lines:
+            # Skip markdown and explanatory text
+            if line.startswith("#") and not line.startswith("# "):
+                continue
+            if any(line.strip().startswith(kw) for kw in ["search_", "navigate_", "store_", "ready_", "get_", "print(", "for ", "if ", "while ", "result"]):
+                in_code = True
+            if in_code:
+                code_lines.append(line)
+        
+        return "\n".join(code_lines).strip() if code_lines else response.strip()
     
     def _tot_evaluate_children(
         self,
@@ -1682,23 +2348,63 @@ Context:
 
 Respond with ONLY the letter and full option text (e.g., "A. [option text]"):"""
         else:
-            synthesis_prompt = f"""Based on the context, answer the question concisely.
+            synthesis_prompt = f"""You have access to the following document sections. Answer the question using ONLY these sections.
+
+STRICT GROUNDING RULES:
+1. Every claim MUST be supported by text from the sections below
+2. Use exact quotes from the document when stating facts
+3. If the answer requires information not in these sections, say "The provided sections do not contain this information"
+4. Do NOT use any knowledge outside these sections
+5. Do NOT paraphrase or infer beyond what is explicitly stated
+6. Be comprehensive - use all relevant information from the sections
 
 Question: {state.question}
 
-Context:
+Document Sections:
 {context_text}
 
-Answer:"""
+Answer (grounded in document sections):"""
+        
+        # Log synthesis inputs
+        logger.info(
+            "synthesis_start",
+            question=state.question,
+            num_variables=len(state.variables),
+            context_length=len(context_text),
+            context_preview=context_text[:300],
+        )
         
         try:
             answer = self._llm_fn(synthesis_prompt)
             state.answer = answer.strip()
-            state.confidence = min(1.0, len(state.variables) * 0.25)
+            # Base initial confidence on having evidence, but verification will adjust
+            # More variables = more evidence, but capped at 0.7 until verified
+            state.confidence = min(0.7, 0.3 + len(state.variables) * 0.1)
+            
+            # Log the synthesized answer
+            logger.info(
+                "synthesis_complete",
+                question=state.question,
+                answer_length=len(state.answer),
+                answer_preview=state.answer[:300],
+                initial_confidence=state.confidence,
+            )
             
             # Normalize multiple choice answer
             if options:
                 state.answer = self._normalize_mc_answer(state.answer, options)
+            
+            # Post-synthesis grounding check: verify key claims exist in source
+            grounded, issues = self._verify_answer_grounded(state.answer, context_text)
+            logger.info(
+                "grounding_check_result",
+                is_grounded=grounded,
+                issues=issues if not grounded else None,
+            )
+            if not grounded:
+                logger.warning("answer_grounding_issues", issues=issues)
+                # Reduce confidence if grounding issues found
+                state.confidence = max(0.3, state.confidence - 0.2)
                 
         except Exception as e:
             logger.error("synthesis_failed", error=str(e))
@@ -1722,8 +2428,88 @@ Answer:"""
         
         return answer
     
+    def _verify_answer_grounded(self, answer: str, context: str) -> tuple[bool, str]:
+        """
+        Verify that key claims in the answer are grounded in the source context.
+        
+        This prevents hallucination by checking that quoted text actually exists
+        in the source material.
+        
+        Args:
+            answer: The synthesized answer
+            context: The source context used for synthesis
+            
+        Returns:
+            Tuple of (is_grounded, issues_description)
+        """
+        import re
+        
+        # Strip markdown formatting from context for comparison
+        # This handles cases like **$750,000 USD** matching $750,000 USD
+        context_clean = re.sub(r'\*+', '', context)  # Remove markdown bold/italic
+        context_clean = re.sub(r'_+', '', context_clean)  # Remove markdown underlines
+        context_clean = re.sub(r'`+', '', context_clean)  # Remove code formatting
+        context_lower = context_clean.lower()
+        
+        # Extract quoted text from answer (text in quotes)
+        quotes = re.findall(r'"([^"]+)"', answer)
+        
+        # Also extract text that looks like specific claims (names, numbers, dates)
+        # These patterns catch specific facts that should be verifiable
+        specific_patterns = [
+            r'\$[\d,]+(?:\.\d{2})?',  # Money amounts
+            r'\b\d{1,2}/\d{1,2}/\d{2,4}\b',  # Dates
+            r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b',  # Written dates
+        ]
+        
+        specific_claims = []
+        for pattern in specific_patterns:
+            specific_claims.extend(re.findall(pattern, answer))
+        
+        ungrounded_quotes = []
+        ungrounded_claims = []
+        
+        # Check if quoted text exists in context (more lenient matching)
+        for quote in quotes:
+            quote_clean = quote.lower().strip()
+            if len(quote_clean) > 10:  # Only check longer quotes
+                # Check if core content exists (allow for partial matches)
+                # Split into words and check if most words are present
+                words = quote_clean.split()
+                found_words = sum(1 for w in words if len(w) > 3 and w in context_lower)
+                if found_words < len([w for w in words if len(w) > 3]) * 0.7:  # 70% threshold
+                    ungrounded_quotes.append(quote[:50])
+        
+        # Check if specific claims exist in context
+        for claim in specific_claims:
+            claim_clean = claim.replace(',', '')  # Handle $750,000 vs $750000
+            if claim_clean.lower() not in context_lower and claim.lower() not in context_lower:
+                ungrounded_claims.append(claim)
+        
+        if ungrounded_quotes or ungrounded_claims:
+            issues = []
+            if ungrounded_quotes:
+                issues.append(f"Ungrounded quotes: {ungrounded_quotes[:2]}")
+            if ungrounded_claims:
+                issues.append(f"Ungrounded claims: {ungrounded_claims[:2]}")
+            
+            logger.warning(
+                "grounding_check_failed",
+                ungrounded_quotes=len(ungrounded_quotes),
+                ungrounded_claims=len(ungrounded_claims),
+            )
+            return False, "; ".join(issues)
+        
+        return True, ""
+    
     def _phase_verify(self, state: RLMAgentState) -> RLMAgentState:
-        """Phase 5: Verify the answer."""
+        """Phase 5: Verify the answer and REJECT if not reliable.
+        
+        Implements a multi-stage verification:
+        1. Standard verification engine checks
+        2. STRICT CRITIC LOOP: Harsh critic tries to disprove the answer
+        3. Only accept if both verifications pass
+        """
         state.add_trace("verification", "Verifying answer")
         
         # Collect evidence
@@ -1731,7 +2517,9 @@ Answer:"""
             self.variable_store.resolve(p) or ""
             for p in state.variables
         ]
+        evidence_text = "\n\n---\n\n".join(e for e in evidence if e)
         
+        # Stage 1: Standard verification
         result = self.verification_engine.verify_answer(
             state.question,
             state.answer or "",
@@ -1740,16 +2528,94 @@ Answer:"""
         
         state.verification_result = result
         
-        if result.get("improved_answer"):
-            state.answer = result["improved_answer"]
+        # Get verification results
+        is_valid = result.get("is_valid", False)  # Default to False, not True
+        confidence = result.get("confidence", 0.0)
+        issues = result.get("issues", [])
         
-        state.confidence = result.get("confidence", state.confidence)
+        # RAISED THRESHOLD: More strict to prevent hallucinations
+        min_confidence_threshold = 0.7
         
-        state.add_trace(
-            "verification",
-            f"Verification complete: valid={result.get('is_valid', True)}",
-            {"issues": result.get("issues", [])},
-        )
+        # Stage 2: STRICT CRITIC LOOP (Red Team verification)
+        # Only run critic if standard verification passed
+        critic_passed = True
+        critic_result = None
+        
+        if is_valid and confidence >= min_confidence_threshold and state.answer:
+            state.add_trace("verification", "Running strict critic loop")
+            
+            # Use LLM function for strict verification
+            llm_fn = None
+            if self._llm_fn:
+                llm_fn = self._llm_fn
+            
+            critic_result = strict_verify_answer(
+                answer=state.answer,
+                sources=evidence_text,
+                question=state.question,
+                llm_fn=llm_fn,
+                max_unsupported_claims=0,  # Strict mode: no unsupported claims allowed
+            )
+            
+            critic_passed = critic_result.verified
+            
+            if not critic_passed:
+                logger.warning(
+                    "critic_loop_rejected_answer",
+                    unsupported_claims=critic_result.unsupported_claims,
+                    rejection_reason=critic_result.rejection_reason,
+                )
+                state.add_trace(
+                    "verification",
+                    f"CRITIC REJECTED: {critic_result.rejection_reason}",
+                    {
+                        "unsupported_claims": critic_result.unsupported_claims,
+                        "claims_analyzed": len(critic_result.claims_analyzed),
+                    },
+                )
+                # Reduce confidence since critic found issues
+                confidence = min(confidence * 0.5, 0.3)
+        
+        # Final decision: both stages must pass
+        if not is_valid or confidence < min_confidence_threshold or not critic_passed:
+            # Reject the answer - don't hallucinate
+            rejection_reason = []
+            if not is_valid:
+                rejection_reason.append("validation failed")
+            if confidence < min_confidence_threshold:
+                rejection_reason.append(f"low confidence ({confidence:.2f})")
+            if not critic_passed and critic_result:
+                rejection_reason.append(f"critic rejected: {critic_result.rejection_reason}")
+            
+            state.answer = "I cannot answer this from the provided text."
+            state.confidence = 0.0
+            state.add_trace(
+                "verification",
+                f"Answer REJECTED: {', '.join(rejection_reason)}",
+                {"issues": issues, "rejected": True, "critic_passed": critic_passed},
+            )
+            logger.info(
+                "answer_rejected",
+                is_valid=is_valid,
+                confidence=confidence,
+                critic_passed=critic_passed,
+                issues=issues,
+            )
+        else:
+            # Accept the answer - both verification stages passed
+            if result.get("improved_answer"):
+                state.answer = result["improved_answer"]
+            state.confidence = confidence
+            state.add_trace(
+                "verification",
+                f"Answer ACCEPTED: valid={is_valid}, confidence={confidence:.2f}, critic_passed={critic_passed}",
+                {"issues": issues},
+            )
+            logger.info(
+                "answer_accepted",
+                confidence=confidence,
+                critic_verified=critic_passed,
+            )
         
         return state
 

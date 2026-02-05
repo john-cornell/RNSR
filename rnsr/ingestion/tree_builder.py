@@ -92,6 +92,9 @@ class TreeBuilder:
             else:
                 self._process_body(span, stack)
         
+        # Post-process: merge small nodes into parent
+        self._merge_small_nodes(root)
+        
         # Count total nodes
         total_nodes = self._count_nodes(root)
         
@@ -203,6 +206,90 @@ class TreeBuilder:
         if current_node.page_num is None:
             current_node.page_num = span.page_num
 
+    # Thresholds for merging small nodes
+    MIN_CONTENT_LENGTH = 50  # Nodes with less content get merged
+    MIN_HEADER_LENGTH = 5   # Headers shorter than this are likely captions
+    CAPTION_PATTERNS = ["figure", "table", "chart", "diagram", "fig.", "tab.", "exhibit"]
+    
+    def _merge_small_nodes(self, node: DocumentNode) -> None:
+        """
+        Post-process: merge small child nodes into parent.
+        
+        Nodes are merged if:
+        - Content is shorter than MIN_CONTENT_LENGTH chars
+        - Header looks like a caption (Figure X, Table X, etc.)
+        - Node has no children of its own
+        """
+        if not node.children:
+            return
+        
+        # First, recursively process all children
+        for child in node.children:
+            self._merge_small_nodes(child)
+        
+        # Now merge small children into this node
+        merged_count = 0
+        children_to_keep = []
+        
+        for child in node.children:
+            should_merge = self._should_merge_into_parent(child)
+            
+            if should_merge:
+                # Merge child content into parent
+                child_text = f"\n\n[{child.header}]\n{child.content}" if child.content else f"\n\n[{child.header}]"
+                if node.content:
+                    node.content += child_text
+                else:
+                    node.content = child_text.strip()
+                
+                # Also merge any grandchildren up
+                children_to_keep.extend(child.children)
+                merged_count += 1
+                
+                logger.debug(
+                    "node_merged",
+                    child_header=child.header[:30],
+                    parent_header=node.header[:30],
+                    reason="small_content" if len(child.content or "") < self.MIN_CONTENT_LENGTH else "caption",
+                )
+            else:
+                children_to_keep.append(child)
+        
+        node.children = children_to_keep
+        
+        if merged_count > 0:
+            logger.info(
+                "nodes_merged_into_parent",
+                merged_count=merged_count,
+                parent=node.header[:30],
+                remaining_children=len(children_to_keep),
+            )
+    
+    def _should_merge_into_parent(self, node: DocumentNode) -> bool:
+        """
+        Determine if a node should be merged into its parent.
+        """
+        # Don't merge nodes that have children (they're section containers)
+        if node.children:
+            return False
+        
+        content_len = len(node.content or "")
+        header_lower = node.header.lower().strip()
+        
+        # Merge if content is very short
+        if content_len < self.MIN_CONTENT_LENGTH:
+            return True
+        
+        # Merge if header looks like a caption
+        if any(pattern in header_lower for pattern in self.CAPTION_PATTERNS):
+            return True
+        
+        # Merge if header is very short (likely a label, not a section)
+        if len(node.header.strip()) < self.MIN_HEADER_LENGTH:
+            return True
+        
+        return False
+    
     def _count_nodes(self, node: DocumentNode) -> int:
         """Recursively count all nodes in the tree."""
         count = 1  # Count this node

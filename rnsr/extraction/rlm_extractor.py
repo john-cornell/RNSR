@@ -74,24 +74,24 @@ entities = []
 
 # Example: Find person names with titles
 for match in re.finditer(r'(?:Mr\.|Mrs\.|Dr\.)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)', SECTION_CONTENT):
-    entities.append({
+    entities.append({{
         "text": match.group(),
         "canonical_name": match.group(1),  # Without title
         "type": "PERSON",
         "start": match.start(),
         "end": match.end(),
         "confidence": 0.9
-    })
+    }})
 
 # Example: Find dollar amounts
 for match in re.finditer(r'\$[\d,]+(?:\.\d{2})?(?:\s*(?:million|billion))?', SECTION_CONTENT):
-    entities.append({
+    entities.append({{
         "text": match.group(),
         "type": "MONETARY",
         "start": match.start(),
         "end": match.end(),
         "confidence": 0.95
-    })
+    }})
 
 # Store results
 store_variable("ENTITIES", entities)

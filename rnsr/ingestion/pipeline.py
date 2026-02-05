@@ -43,7 +43,7 @@ from rnsr.ingestion.layout_detector import detect_layout_complexity
 from rnsr.ingestion.ocr_fallback import has_extractable_text, try_ocr_ingestion
 from rnsr.ingestion.semantic_fallback import try_semantic_splitter_ingestion
 from rnsr.ingestion.tree_builder import build_document_tree, build_multi_document_tree
-from rnsr.models import DocumentTree, IngestionResult
+from rnsr.models import DocumentNode, DocumentTree, IngestionResult
 
 logger = structlog.get_logger(__name__)
 
@@ -89,12 +89,47 @@ def ingest_document(
     pdf_path = Path(pdf_path)
     
     if not pdf_path.exists():
-        raise IngestionError(f"PDF file not found: {pdf_path}")
+        raise IngestionError(f"Document file not found: {pdf_path}")
     
     logger.info("ingestion_started", path=str(pdf_path))
     
     warnings: list[str] = []
     stats: dict = {"path": str(pdf_path)}
+    
+    # Handle text/markdown files directly with pattern-based headers
+    if pdf_path.suffix.lower() in {'.md', '.txt', '.text', '.markdown'}:
+        from rnsr.ingestion.semantic_fallback import _try_pattern_based_headers
+        
+        logger.info("text_file_detected", path=str(pdf_path))
+        text = pdf_path.read_text(encoding='utf-8')
+        
+        # Try pattern-based header detection first
+        tree = _try_pattern_based_headers(text, pdf_path.stem)
+        if tree:
+            return IngestionResult(
+                tree=tree,
+                tier_used=2,  # Pattern-based is a sub-tier of tier 2
+                method="pattern_based_headers",
+                stats=stats,
+                warnings=warnings,
+            )
+        
+        # Fallback: create a simple tree from the text
+        root = DocumentNode(id="root", level=0, header=pdf_path.stem, content=text)
+        tree = DocumentTree(
+            title=pdf_path.stem,
+            root=root,
+            total_nodes=1,
+            ingestion_tier=2,
+            ingestion_method="semantic_splitter",
+        )
+        return IngestionResult(
+            tree=tree,
+            tier_used=2,
+            method="semantic_splitter",
+            stats=stats,
+            warnings=warnings,
+        )
     
     # Check if document has extractable text
     if not has_extractable_text(pdf_path):

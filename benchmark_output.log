@@ -1,0 +1,298 @@
+╭─────────────────────────────────────────────╮
+│ RNSR Comparison Benchmark                   │
+│ Comparing RNSR vs Naive RAG vs Long Context │
+╰─────────────────────────────────────────────╯
+
+📊 Running Comparison Benchmark
+
+Ingesting document...
+NaiveRAG: Created 19 chunks
+LongContext: Full document (8,570 chars)
+2026-02-05 12:12:32 [info     ] skeleton_builder_initialized
+2026-02-05 12:12:32 [info     ] building_skeleton_index        doc_id=doc total_nodes=55
+2026-02-05 12:12:32 [info     ] skeleton_index_complete        indexed_nodes=55 kv_entries=55
+RNSR: 55 nodes
+
+2026-02-05 12:12:32 [info     ] provider_detected              provider=gemini
+2026-02-05 12:12:32 [debug    ] initializing_llm               
+model=gemini-2.5-flash provider=gemini
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+2026-02-05 12:12:33 [debug    ] llm_with_fallback_configured   
+fallbacks=['openai', 'anthropic'] primary=gemini
+2026-02-05 12:12:34 [debug    ] initializing_llm               model=gpt-5-mini 
+provider=openai
+2026-02-05 12:12:34 [info     ] fallback_llm_initialized       model=gpt-5-mini 
+provider=openai
+2026-02-05 12:12:35 [debug    ] initializing_llm               
+model=claude-sonnet-4-5 provider=anthropic
+2026-02-05 12:12:35 [info     ] fallback_llm_initialized       
+model=claude-sonnet-4-5 provider=anthropic
+2026-02-05 12:13:30 [debug    ] variable_store_initialized
+2026-02-05 12:13:30 [debug    ] variable_store_initialized
+2026-02-05 12:13:30 [info     ] nav_repl_initialized           num_nodes=55 
+root_children=1
+2026-02-05 12:13:30 [info     ] rlm_navigation_started         question='Who are
+the parties to this contract?'
+2026-02-05 12:13:30 [debug    ] keywords_extracted             keywords=['who', 
+'parties', 'contract'] query='Who are the parties to this contract?'
+2026-02-05 12:13:30 [debug    ] pre_filter_complete            keywords=['who', 
+'parties', 'contract'] matching=10 remaining=45 total=55
+2026-02-05 12:13:30 [info     ] repl_allowed_nodes_set         num_allowed=16 
+sample=['section_36', 'root', 'section_10', 'section_35', 'section_43']
+2026-02-05 12:13:45 [info     ] deterministic_nav_start        keywords=['who', 
+'parties', 'contract'] query="Identify the named parties to the contract, 
+including their full legal names and any designated roles (e.g., 'Client', 
+'Service Provider')."
+2026-02-05 12:13:45 [debug    ] variable_store_initialized
+2026-02-05 12:13:45 [info     ] search_tree_start              from_node=root 
+max_depth=5 pattern=(?i)(who|parties|contract)
+2026-02-05 12:13:45 [info     ] search_tree_complete           
+pattern=(?i)(who|parties|contract) returned=10 top_results=[('3.1 Total Contract
+Value', 11.7, 'section_10'), ('1. PARTIES AND RECITALS', 10.8, 'section_1'), 
+('PROFESSIONAL SERVICES AGREEMENT', 3.3, 'section_0'), ('1.3 Recitals', 1.95, 
+'section_4'), ('3.2 Payment Schedule', 1.95, 'section_11')] total_matches=10
+2026-02-05 12:13:45 [info     ] deterministic_nav_search_results num_results=10 
+top_results=[('3.1 Total Contract Value', 11.7, 'section_10'), ('1. PARTIES AND 
+RECITALS', 10.8, 'section_1'), ('PROFESSIONAL SERVICES AGREEMENT', 3.3, 
+'section_0'), ('1.3 Recitals', 1.95, 'section_4'), ('3.2 Payment Schedule', 
+1.95, 'section_11')]
+2026-02-05 12:13:45 [info     ] variable_assigned              chars=119 
+pointer=$N3_1_TOTAL_CONTRACT_VALUE source=section_10
+2026-02-05 12:13:45 [info     ] deterministic_finding_stored   
+content_length=119 header='3.1 Total Contract Value' node_id=section_10 
+pointer=$N3_1_TOTAL_CONTRACT_VALUE score=11.7
+2026-02-05 12:13:45 [info     ] variable_assigned              chars=201 
+pointer=$PROFESSIONAL_SERVICES_AGREEMEN source=section_0
+2026-02-05 12:13:45 [info     ] deterministic_finding_stored   
+content_length=201 header='PROFESSIONAL SERVICES AGREEMENT' node_id=section_0 
+pointer=$PROFESSIONAL_SERVICES_AGREEMEN score=3.3
+2026-02-05 12:13:45 [info     ] deterministic_nav_complete     findings_stored=2
+variables=['$N3_1_TOTAL_CONTRACT_VALUE', '$PROFESSIONAL_SERVICES_AGREEMEN']
+2026-02-05 12:13:45 [debug    ] variable_resolved              
+pointer=$N3_1_TOTAL_CONTRACT_VALUE
+2026-02-05 12:13:45 [debug    ] variable_resolved              
+pointer=$PROFESSIONAL_SERVICES_AGREEMEN
+2026-02-05 12:13:45 [info     ] synthesis_start                
+context_length=397 context_preview='=== $N3_1_TOTAL_CONTRACT_VALUE ===\n3.1 
+Total Contract Value\n\nThe total value of this agreement is **$750,000 USD** 
+(Seven Hundred Fifty Thousand Dollars).\n\n=== $PROFESSIONAL_SERVICES_AGREEMEN 
+===\nPROFESSIONAL SERVICES AGREEMENT\n\n**Contract Number:** PSA-2024-00142  
+\n**Effective Date:** January 15, 2' num_variables=2 question='Who are the 
+parties to this contract?'
+2026-02-05 12:13:46 [info     ] synthesis_complete             answer_length=109
+answer_preview='The parties to this contract are "Acme Technologies Inc. 
+("Client") and DataSoft Solutions LLC ("Provider")".' initial_confidence=0.5 
+question='Who are the parties to this contract?'
+2026-02-05 12:13:46 [info     ] grounding_check_result         is_grounded=True 
+issues=None
+2026-02-05 12:13:46 [debug    ] variable_resolved              
+pointer=$N3_1_TOTAL_CONTRACT_VALUE
+2026-02-05 12:13:46 [debug    ] variable_resolved              
+pointer=$PROFESSIONAL_SERVICES_AGREEMEN
+2026-02-05 12:13:49 [info     ] rlm_navigation_complete        confidence=1.0 
+iterations=2 variables=2
+2026-02-05 12:14:23 [info     ] rlm_navigation_started         question='What is
+the total contract value?'
+2026-02-05 12:14:23 [debug    ] keywords_extracted             
+keywords=['total', 'contract', 'value', 'what'] query='What is the total 
+contract value?'
+2026-02-05 12:14:23 [debug    ] pre_filter_complete            
+keywords=['total', 'contract', 'value', 'what'] matching=4 remaining=51 total=55
+2026-02-05 12:14:23 [info     ] repl_allowed_nodes_set         num_allowed=7 
+sample=['root', 'section_10', 'section_11', 'section_9', 'section_0']
+2026-02-05 12:14:25 [info     ] deterministic_nav_start        
+keywords=['total', 'contract', 'value', 'what'] query="Extract the value 
+specified as 'Total Contract Value' from the document."
+2026-02-05 12:14:25 [debug    ] variable_store_initialized
+2026-02-05 12:14:25 [info     ] search_tree_start              from_node=root 
+max_depth=5 pattern=(?i)(total|contract|value|what)
+2026-02-05 12:14:25 [info     ] search_tree_complete           
+pattern=(?i)(total|contract|value|what) returned=4 top_results=[('3.1 Total 
+Contract Value', 39.0, 'section_10'), ('7.3 Limitation of Liability', 7.8, 
+'section_30'), ('3.2 Payment Schedule', 1.95, 'section_11'), ('PROFESSIONAL 
+SERVICES AGREEMENT', 1.65, 'section_0')] total_matches=4
+2026-02-05 12:14:25 [info     ] deterministic_nav_search_results num_results=4 
+top_results=[('3.1 Total Contract Value', 39.0, 'section_10'), ('7.3 Limitation 
+of Liability', 7.8, 'section_30'), ('3.2 Payment Schedule', 1.95, 'section_11'),
+('PROFESSIONAL SERVICES AGREEMENT', 1.65, 'section_0')]
+2026-02-05 12:14:25 [info     ] variable_assigned              chars=119 
+pointer=$N3_1_TOTAL_CONTRACT_VALUE source=section_10
+2026-02-05 12:14:25 [info     ] deterministic_finding_stored   
+content_length=119 header='3.1 Total Contract Value' node_id=section_10 
+pointer=$N3_1_TOTAL_CONTRACT_VALUE score=39.0
+2026-02-05 12:14:25 [info     ] variable_assigned              chars=307 
+pointer=$N7_3_LIMITATION_OF_LIABILITY source=section_30
+2026-02-05 12:14:25 [info     ] deterministic_finding_stored   
+content_length=307 header='7.3 Limitation of Liability' node_id=section_30 
+pointer=$N7_3_LIMITATION_OF_LIABILITY score=7.8
+2026-02-05 12:14:25 [debug    ] section_relevance_rejected     header='3.2 
+Payment Schedule' node_id=section_11 reason='low relevance to query'
+2026-02-05 12:14:25 [info     ] deterministic_nav_complete     findings_stored=2
+variables=['$N3_1_TOTAL_CONTRACT_VALUE', '$N7_3_LIMITATION_OF_LIABILITY']
+2026-02-05 12:14:25 [debug    ] variable_resolved              
+pointer=$N3_1_TOTAL_CONTRACT_VALUE
+2026-02-05 12:14:25 [debug    ] variable_resolved              
+pointer=$N7_3_LIMITATION_OF_LIABILITY
+2026-02-05 12:14:25 [info     ] synthesis_start                
+context_length=501 context_preview='=== $N3_1_TOTAL_CONTRACT_VALUE ===\n3.1 
+Total Contract Value\n\nThe total value of this agreement is **$750,000 USD** 
+(Seven Hundred Fifty Thousand Dollars).\n\n=== $N7_3_LIMITATION_OF_LIABILITY 
+===\n7.3 Limitation of Liability\n\n- **Cap:** Total liability shall not exceed 
+the total contract value ($750,00' num_variables=2 question='What is the total 
+contract value?'
+2026-02-05 12:14:27 [info     ] synthesis_complete             answer_length=91 
+answer_preview='The total value of this agreement is "$750,000 USD" (Seven 
+Hundred Fifty Thousand Dollars).' initial_confidence=0.5 question='What is the 
+total contract value?'
+2026-02-05 12:14:27 [info     ] grounding_check_result         is_grounded=True 
+issues=None
+2026-02-05 12:14:27 [debug    ] variable_resolved              
+pointer=$N3_1_TOTAL_CONTRACT_VALUE
+2026-02-05 12:14:27 [debug    ] variable_resolved              
+pointer=$N7_3_LIMITATION_OF_LIABILITY
+2026-02-05 12:14:30 [info     ] rlm_navigation_complete        confidence=1.0 
+iterations=2 variables=2
+2026-02-05 12:15:24 [info     ] rlm_navigation_started         question='What is
+the deliverable for Phase 1 and when is it due?'
+2026-02-05 12:15:24 [debug    ] keywords_extracted             
+keywords=['deliverable', 'phase', 'due', 'what'] query='What is the deliverable 
+for Phase 1 and when is it'
+2026-02-05 12:15:24 [debug    ] pre_filter_complete            
+keywords=['deliverable', 'phase', 'due', 'what'] matching=5 remaining=50 
+total=55
+2026-02-05 12:15:24 [info     ] repl_allowed_nodes_set         num_allowed=11 
+sample=['section_7', 'section_28', 'section_45', 'section_9', 'section_27']
+2026-02-05 12:15:28 [info     ] deterministic_nav_start        
+keywords=['deliverable', 'phase', 'due', 'what'] query='Identify the specific 
+deliverable for Phase 1.'
+2026-02-05 12:15:28 [debug    ] variable_store_initialized
+2026-02-05 12:15:28 [info     ] search_tree_start              from_node=root 
+max_depth=5 pattern=(?i)(deliverable|phase|due|what)
+2026-02-05 12:15:28 [info     ] search_tree_complete           
+pattern=(?i)(deliverable|phase|due|what) returned=5 top_results=[('2.2 
+Deliverables', 23.4, 'section_7'), ('3.2 Payment Schedule', 7.8, 'section_11'), 
+('5.1 Work Product Ownership', 1.95, 'section_19'), ('7.1 Provider Warranties', 
+1.95, 'section_28'), ('10.6 Force Majeure', 1.95, 'section_45')] total_matches=5
+2026-02-05 12:15:28 [info     ] deterministic_nav_search_results num_results=5 
+top_results=[('2.2 Deliverables', 23.4, 'section_7'), ('3.2 Payment Schedule', 
+7.8, 'section_11'), ('5.1 Work Product Ownership', 1.95, 'section_19'), ('7.1 
+Provider Warranties', 1.95, 'section_28'), ('10.6 Force Majeure', 1.95, 
+'section_45')]
+2026-02-05 12:15:28 [info     ] variable_assigned              chars=363 
+pointer=$N2_2_DELIVERABLES source=section_7
+2026-02-05 12:15:28 [info     ] deterministic_finding_stored   
+content_length=363 header='2.2 Deliverables' node_id=section_7 
+pointer=$N2_2_DELIVERABLES score=23.4
+2026-02-05 12:15:28 [info     ] variable_assigned              chars=372 
+pointer=$N3_2_PAYMENT_SCHEDULE source=section_11
+2026-02-05 12:15:28 [info     ] deterministic_finding_stored   
+content_length=372 header='3.2 Payment Schedule' node_id=section_11 
+pointer=$N3_2_PAYMENT_SCHEDULE score=7.8
+2026-02-05 12:15:28 [debug    ] section_relevance_rejected     header='5.1 Work 
+Product Ownership' node_id=section_19 reason='low relevance to query'
+2026-02-05 12:15:28 [info     ] deterministic_nav_complete     findings_stored=2
+variables=['$N2_2_DELIVERABLES', '$N3_2_PAYMENT_SCHEDULE']
+2026-02-05 12:15:28 [debug    ] variable_resolved              
+pointer=$N2_2_DELIVERABLES
+2026-02-05 12:15:28 [debug    ] variable_resolved              
+pointer=$N3_2_PAYMENT_SCHEDULE
+2026-02-05 12:15:28 [info     ] synthesis_start                
+context_length=795 context_preview='=== $N2_2_DELIVERABLES ===\n2.2 
+Deliverables\n\n| Deliverable | Description | Due Date 
+|\n|-------------|-------------|----------|\n| Phase 1: Discovery | Requirements
+documentation | February 28, 2024 |\n| Phase 2: Development | Core platform 
+build | May 31, 2024 |\n| Phase 3: Testing | UAT and integratio' num_variables=2
+question='What is the deliverable for Phase 1 and when is it due?'
+2026-02-05 12:15:30 [info     ] synthesis_complete             answer_length=100
+answer_preview='The deliverable for Phase 1 is "Requirements documentation" and 
+its due date is "February 28, 2024".' initial_confidence=0.5 question='What is 
+the deliverable for Phase 1 and when is it due?'
+2026-02-05 12:15:30 [info     ] grounding_check_result         is_grounded=True 
+issues=None
+2026-02-05 12:15:30 [debug    ] variable_resolved              
+pointer=$N2_2_DELIVERABLES
+2026-02-05 12:15:30 [debug    ] variable_resolved              
+pointer=$N3_2_PAYMENT_SCHEDULE
+2026-02-05 12:15:33 [info     ] rlm_navigation_complete        confidence=1.0 
+iterations=2 variables=2
+2026-02-05 12:16:24 [info     ] rlm_navigation_started         question='What 
+are the termination conditions?'
+2026-02-05 12:16:24 [debug    ] keywords_extracted             
+keywords=['termination', 'conditions', 'what'] query='What are the termination 
+conditions?'
+2026-02-05 12:16:24 [debug    ] pre_filter_complete            
+keywords=['termination', 'conditions', 'what'] matching=4 remaining=51 total=55
+2026-02-05 12:16:24 [info     ] repl_allowed_nodes_set         num_allowed=7 
+sample=['section_14', 'section_26', 'root', 'section_16', 'section_22']
+2026-02-05 12:16:27 [info     ] deterministic_nav_start        
+keywords=['termination', 'conditions', 'what'] query='Identify the conditions 
+under which termination for convenience can occur.'
+2026-02-05 12:16:27 [debug    ] variable_store_initialized
+2026-02-05 12:16:27 [info     ] search_tree_start              from_node=root 
+max_depth=5 pattern=(?i)(termination|conditions|what)
+2026-02-05 12:16:27 [info     ] search_tree_complete           
+pattern=(?i)(termination|conditions|what) returned=4 top_results=[('4.2 
+Termination for Convenience', 15.6, 'section_16'), ('4.3 Termination for Cause',
+11.7, 'section_17'), ('4. TERM AND TERMINATION', 10.8, 'section_14'), ('6.4 
+Duration', 1.95, 'section_26')] total_matches=4
+2026-02-05 12:16:27 [info     ] deterministic_nav_search_results num_results=4 
+top_results=[('4.2 Termination for Convenience', 15.6, 'section_16'), ('4.3 
+Termination for Cause', 11.7, 'section_17'), ('4. TERM AND TERMINATION', 10.8, 
+'section_14'), ('6.4 Duration', 1.95, 'section_26')]
+2026-02-05 12:16:27 [info     ] variable_assigned              chars=217 
+pointer=$N4_2_TERMINATION_FOR_CONVENIEN source=section_16
+2026-02-05 12:16:27 [info     ] deterministic_finding_stored   
+content_length=217 header='4.2 Termination for Convenience' node_id=section_16 
+pointer=$N4_2_TERMINATION_FOR_CONVENIEN score=15.6
+2026-02-05 12:16:27 [info     ] variable_assigned              chars=226 
+pointer=$N4_3_TERMINATION_FOR_CAUSE source=section_17
+2026-02-05 12:16:27 [info     ] deterministic_finding_stored   
+content_length=226 header='4.3 Termination for Cause' node_id=section_17 
+pointer=$N4_3_TERMINATION_FOR_CAUSE score=11.7
+2026-02-05 12:16:27 [info     ] deterministic_nav_complete     findings_stored=2
+variables=['$N4_2_TERMINATION_FOR_CONVENIEN', '$N4_3_TERMINATION_FOR_CAUSE']
+2026-02-05 12:16:27 [debug    ] variable_resolved              
+pointer=$N4_2_TERMINATION_FOR_CONVENIEN
+2026-02-05 12:16:27 [debug    ] variable_resolved              
+pointer=$N4_3_TERMINATION_FOR_CAUSE
+2026-02-05 12:16:27 [info     ] synthesis_start                
+context_length=521 context_preview='=== $N4_2_TERMINATION_FOR_CONVENIEN ===\n4.2
+Termination for Convenience\n\nEither party may terminate with 60 days written 
+notice. Upon termination:\n- Client pays for work completed through termination 
+date\n- Provider delivers all work product created to date\n\n=== 
+$N4_3_TERMINATION_FOR_CAUSE ===\n4.3 T' num_variables=2 question='What are the 
+termination conditions?'
+2026-02-05 12:16:30 [info     ] synthesis_complete             answer_length=388
+answer_preview='The termination conditions are as follows:\n\n*   **Termination 
+for Convenience:** "Either party may terminate with 60 days written notice."\n* 
+**Termination for Cause:** Either party may terminate immediately if the other 
+party:\n    *   "Breaches a material term and fails to cure within 30 days"\n   
+' initial_confidence=0.5 question='What are the termination conditions?'
+2026-02-05 12:16:30 [info     ] grounding_check_result         is_grounded=True 
+issues=None
+2026-02-05 12:16:30 [debug    ] variable_resolved              
+pointer=$N4_2_TERMINATION_FOR_CONVENIEN
+2026-02-05 12:16:30 [debug    ] variable_resolved              
+pointer=$N4_3_TERMINATION_FOR_CAUSE
+2026-02-05 12:16:33 [info     ] rlm_navigation_complete        confidence=1.0 
+iterations=2 variables=2
+Running queries... ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% 0:00:00
+
+
+📈 Benchmark Results
+
+                       Performance Comparison                        
+┏━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Method       ┃ Avg Time ┃ Relevance ┃ Correctness ┃ Hallucination ┃
+┡━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ Naive RAG    │ 9.95s    │ 100%      │ 52%         │ 57%           │
+│ Long Context │ 6.56s    │ 100%      │ 100%        │ 17%           │
+│ RNSR         │ 11.25s   │ 100%      │ 83%         │ 20%           │
+└──────────────┴──────────┴───────────┴─────────────┴───────────────┘
+
+Analysis:
+
+  ✅ RNSR correctness is 58% better than Naive RAG
+  ✅ RNSR reduces hallucination by 65%
+
+📄 Report saved to: benchmark_comparison_report.json
