@@ -571,6 +571,169 @@ def get_learned_query_patterns() -> LearnedQueryPatterns:
 
 
 # =============================================================================
+# Learned Section Patterns - Maps query keywords to successful section types
+# =============================================================================
+
+DEFAULT_SECTION_PATTERNS_PATH = Path.home() / ".rnsr" / "learned_section_patterns.json"
+
+
+class LearnedSectionPatterns:
+    """
+    Learn which section types successfully answer which query types.
+    
+    Example learnings:
+    - "parties" queries -> "Information" sections (Client Information, Provider Information)
+    - "termination" queries -> "Termination" and "Term" sections
+    - "payment" queries -> "Payment", "Compensation" sections
+    
+    This is used to boost scoring for sections that historically answer similar queries.
+    """
+    
+    def __init__(
+        self,
+        storage_path: Path | str | None = None,
+        auto_save: bool = True,
+    ):
+        self.storage_path = Path(storage_path) if storage_path else DEFAULT_SECTION_PATTERNS_PATH
+        self.auto_save = auto_save
+        
+        self._lock = Lock()
+        # Maps query_keyword -> {section_header_word -> success_count}
+        self._patterns: dict[str, dict[str, int]] = {}
+        self._dirty = False
+        
+        self._load()
+    
+    def _load(self) -> None:
+        """Load learned patterns from storage."""
+        if not self.storage_path.exists():
+            return
+        
+        try:
+            with open(self.storage_path, "r") as f:
+                data = json.load(f)
+            
+            self._patterns = data.get("patterns", {})
+            
+            logger.info(
+                "section_patterns_loaded",
+                query_keywords=len(self._patterns),
+            )
+            
+        except Exception as e:
+            logger.warning("failed_to_load_section_patterns", error=str(e))
+    
+    def _save(self) -> None:
+        """Save to storage."""
+        if not self._dirty:
+            return
+        
+        try:
+            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            data = {
+                "version": "1.0",
+                "updated_at": datetime.utcnow().isoformat(),
+                "patterns": self._patterns,
+            }
+            
+            with open(self.storage_path, "w") as f:
+                json.dump(data, f, indent=2)
+            
+            self._dirty = False
+            
+            logger.info("section_patterns_saved", patterns=len(self._patterns))
+            
+        except Exception as e:
+            logger.warning("failed_to_save_section_patterns", error=str(e))
+    
+    def record_success(
+        self,
+        query_keywords: list[str],
+        successful_section_headers: list[str],
+    ) -> None:
+        """
+        Record that certain sections successfully answered a query.
+        
+        Args:
+            query_keywords: Keywords from the query (e.g., ["parties", "contract"])
+            successful_section_headers: Headers of sections that provided good answers
+                (e.g., ["1.1 Client Information", "1.2 Provider Information"])
+        """
+        with self._lock:
+            for keyword in query_keywords:
+                keyword = keyword.lower().strip()
+                if len(keyword) < 3:
+                    continue
+                
+                if keyword not in self._patterns:
+                    self._patterns[keyword] = {}
+                
+                # Extract significant words from section headers
+                for header in successful_section_headers:
+                    header_words = re.findall(r'\b[A-Za-z]{4,}\b', header)
+                    for word in header_words:
+                        word = word.lower()
+                        self._patterns[keyword][word] = self._patterns[keyword].get(word, 0) + 1
+            
+            self._dirty = True
+            
+            if self.auto_save:
+                self._save()
+            
+            logger.info(
+                "section_pattern_recorded",
+                keywords=query_keywords,
+                sections=[h[:50] for h in successful_section_headers],
+            )
+    
+    def get_boosted_header_words(self, query_keywords: list[str], min_count: int = 2) -> set[str]:
+        """
+        Get header words that should be boosted for this query based on past successes.
+        
+        Args:
+            query_keywords: Keywords from the current query
+            min_count: Minimum success count to include a word
+            
+        Returns:
+            Set of header words that historically lead to successful answers
+        """
+        boosted_words = set()
+        
+        with self._lock:
+            for keyword in query_keywords:
+                keyword = keyword.lower().strip()
+                if keyword in self._patterns:
+                    for word, count in self._patterns[keyword].items():
+                        if count >= min_count:
+                            boosted_words.add(word)
+        
+        return boosted_words
+    
+    def get_all_patterns(self) -> dict[str, dict[str, int]]:
+        """Get all learned patterns."""
+        with self._lock:
+            return {k: dict(v) for k, v in self._patterns.items()}
+
+
+# Global section patterns registry
+_global_section_patterns: LearnedSectionPatterns | None = None
+
+
+def get_learned_section_patterns() -> LearnedSectionPatterns:
+    """Get the global learned section patterns registry."""
+    global _global_section_patterns
+    
+    if _global_section_patterns is None:
+        custom_path = os.getenv("RNSR_SECTION_PATTERNS_PATH")
+        _global_section_patterns = LearnedSectionPatterns(
+            storage_path=custom_path if custom_path else None
+        )
+    
+    return _global_section_patterns
+
+
+# =============================================================================
 # RLM Configuration
 # =============================================================================
 
@@ -1284,6 +1447,10 @@ class RLMNavigator:
                 variables=len(state.variables),
                 iterations=state.iteration,
             )
+            
+            # Record successful patterns for learning
+            if state.confidence >= 0.5 and state.variables:
+                self._record_successful_patterns(state)
             
             return state.to_dict()
             
