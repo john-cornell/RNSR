@@ -84,14 +84,16 @@ client = RNSRClient()
 answer = client.ask("contract.pdf", "What are the payment terms?")
 print(answer)
 
-# Advanced navigation with verification and self-reflection
+# Advanced navigation with Knowledge Graph (recommended for best accuracy)
+# This matches the benchmark's zero-hallucination performance
 result = client.ask_advanced(
     "complex_report.pdf",
     "Compare liability clauses in sections 5 and 8",
-    enable_verification=True,
-    enable_self_reflection=True,
-    max_recursion_depth=3,
+    use_knowledge_graph=True,   # Entity extraction for better accuracy
+    enable_verification=False,  # Set True for strict mode
 )
+print(f"Answer: {result['answer']}")
+print(f"Confidence: {result['confidence']}")
 ```
 
 ### 3. Run the Demo UI
@@ -100,6 +102,103 @@ result = client.ask_advanced(
 python demo.py
 # Open http://localhost:7860 in your browser
 ```
+
+## Production Setup: Achieving Benchmark-Level Performance
+
+The RNSR benchmark (`make benchmark-compare`) achieves zero hallucinations and high accuracy. Here's how to replicate this performance in your own application:
+
+### Why the Benchmark Works So Well
+
+The benchmark uses three key components that work together:
+
+1. **Knowledge Graph with Entity Extraction** - Automatically extracts and indexes:
+   - Organization names (companies, firms)
+   - Person names and roles
+   - Monetary values and dates
+   - Section/clause references
+   
+2. **Cached LLM Instance** - Reuses a single LLM instance across queries for consistency and reduced latency
+
+3. **RLMNavigator with Entity Awareness** - The navigator can query the knowledge graph to understand relationships between entities in the document
+
+### Replicating in Your Application
+
+Use `ask_advanced()` with knowledge graph enabled (the default):
+
+```python
+from rnsr import RNSRClient
+
+# Create client with caching (recommended for production)
+client = RNSRClient(cache_dir="./rnsr_cache")
+
+# Ask questions with knowledge graph (matches benchmark performance)
+result = client.ask_advanced(
+    "document.pdf",
+    "What are the total compensation amounts?",
+    use_knowledge_graph=True,   # Enables entity extraction
+    enable_verification=False,  # Set True for strict mode
+)
+
+print(f"Answer: {result['answer']}")
+print(f"Confidence: {result['confidence']}")
+
+# Multiple queries on the same document reuse cached index + knowledge graph
+result2 = client.ask_advanced(
+    "document.pdf",
+    "Who are the parties mentioned?",
+)
+```
+
+### Advanced: Direct Navigator Access
+
+For maximum control (as used in benchmarks), access the navigator directly:
+
+```python
+from rnsr.agent.rlm_navigator import RLMNavigator, RLMConfig
+from rnsr.indexing import load_index
+from rnsr.indexing.knowledge_graph import KnowledgeGraph
+
+# Load pre-built index
+skeleton, kv_store = load_index("./cache/my_document")
+
+# Build knowledge graph with entities
+kg = KnowledgeGraph(":memory:")
+# ... add entities from your extraction logic ...
+
+# Create navigator with all components
+config = RLMConfig(
+    max_recursion_depth=3,
+    enable_pre_filtering=True,
+    enable_verification=False,
+)
+
+navigator = RLMNavigator(
+    skeleton=skeleton,
+    kv_store=kv_store,
+    knowledge_graph=kg,
+    config=config,
+)
+
+# Run queries
+result = navigator.navigate("What is the contract value?")
+```
+
+### `ask_advanced()` Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `use_rlm` | `True` | Use RLM Navigator (vs. simpler navigator) |
+| `use_knowledge_graph` | `True` | Extract entities and build knowledge graph |
+| `enable_pre_filtering` | `True` | Filter nodes by keywords before LLM calls |
+| `enable_verification` | `False` | Enable strict critic loop (can reject valid answers) |
+| `max_recursion_depth` | `3` | Maximum depth for recursive sub-LLM calls |
+
+### Performance Tips
+
+1. **Always use `cache_dir`** - Avoids re-indexing documents on every query
+2. **Keep `use_knowledge_graph=True`** - This is key to benchmark-level accuracy
+3. **Set `enable_verification=False`** for most cases - The critic can be too aggressive
+4. **Reuse the same client instance** - The navigator and knowledge graph are cached
 
 ## New Features
 

@@ -758,12 +758,18 @@ def display_report(report: ComparisonReport):
         naive = report.summary["naive_rag"]
         
         if rnsr["avg_correctness"] > naive["avg_correctness"]:
-            improvement = (rnsr["avg_correctness"] - naive["avg_correctness"]) / naive["avg_correctness"] * 100
-            console.print(f"  ✅ RNSR correctness is [green]{improvement:.0f}% better[/green] than Naive RAG")
+            if naive["avg_correctness"] > 0:
+                improvement = (rnsr["avg_correctness"] - naive["avg_correctness"]) / naive["avg_correctness"] * 100
+                console.print(f"  ✅ RNSR correctness is [green]{improvement:.0f}% better[/green] than Naive RAG")
+            else:
+                console.print(f"  ✅ RNSR correctness is [green]{rnsr['avg_correctness']*100:.0f}%[/green] vs Naive RAG [red]0%[/red]")
         
         if rnsr["avg_hallucination"] < naive["avg_hallucination"]:
-            reduction = (naive["avg_hallucination"] - rnsr["avg_hallucination"]) / naive["avg_hallucination"] * 100
-            console.print(f"  ✅ RNSR reduces hallucination by [green]{reduction:.0f}%[/green]")
+            if naive["avg_hallucination"] > 0:
+                reduction = (naive["avg_hallucination"] - rnsr["avg_hallucination"]) / naive["avg_hallucination"] * 100
+                console.print(f"  ✅ RNSR reduces hallucination by [green]{reduction:.0f}%[/green]")
+            else:
+                console.print(f"  ✅ Both methods have minimal hallucination")
 
 
 def create_sample_queries() -> list[BenchmarkQuery]:
@@ -974,12 +980,267 @@ def run_large_benchmark():
     console.print(f"\n[green]📄 Report saved to: {report_path}[/green]")
 
 
+def get_workers_comp_queries() -> list[BenchmarkQuery]:
+    """
+    Predefined Q&A for Workers Compensation Act 1987.
+    Ground truth answers are the key facts that should be present.
+    """
+    return [
+        # Claims and Eligibility
+        BenchmarkQuery(
+            question='How is an "injury" defined under the Act?',
+            ground_truth_answer=(
+                "Injury refers to personal injury arising out of or in the course of employment. "
+                "It includes disease injuries where employment was the main contributing factor. "
+                "It covers aggravation or acceleration of existing disease if employment was the main contributing factor. "
+                "For psychological injuries, it excludes conditions caused wholly or predominantly by reasonable employer action regarding discipline, transfer, or dismissal."
+            ),
+            difficulty="medium",
+        ),
+        BenchmarkQuery(
+            question="Does workers' compensation cover accidents that happen while traveling to work?",
+            ground_truth_answer=(
+                "Generally, compensation is not payable for injuries received during a journey to or from work. "
+                "An exception exists if there is a real and substantial connection between the employment and the incident. "
+                "Coverage is disqualified if the injury is attributable to serious and wilful misconduct, such as being under the influence of alcohol or drugs."
+            ),
+            difficulty="medium",
+        ),
+        # Weekly Payments and Capacity
+        BenchmarkQuery(
+            question="How are weekly payment rates determined for an injured worker?",
+            ground_truth_answer=(
+                "First 13 weeks: 95% of pre-injury average weekly earnings (PIAWE). "
+                "Weeks 14 to 130: 80% of PIAWE, or 95% if worker has returned to work for at least 15 hours per week. "
+                "After 130 weeks: entitlement generally ceases unless worker has no work capacity likely to continue indefinitely, or is working at least 15 hours and meeting specific earning thresholds."
+            ),
+            difficulty="hard",
+        ),
+        BenchmarkQuery(
+            question='What qualifies as "suitable employment" for a worker who is partially incapacitated?',
+            ground_truth_answer=(
+                "Suitable employment is work for which the worker is currently suited based on their age, education, skills, and work experience. "
+                "It must be within the worker's functional capacity as detailed in medical information or certificates of capacity. "
+                "Work is considered suitable regardless of whether that specific job is currently available in the market or where the worker lives."
+            ),
+            difficulty="medium",
+        ),
+        # Medical Expenses and Permanent Impairment
+        BenchmarkQuery(
+            question="What medical costs is an employer required to cover?",
+            ground_truth_answer=(
+                "Employers are liable for medical or hospital treatment, ambulance services, and workplace rehabilitation that is reasonably necessary. "
+                "They must cover travel expenses necessarily incurred to receive treatment. "
+                "Prior approval from the insurer is generally required except for treatment within 48 hours of the injury."
+            ),
+            difficulty="medium",
+        ),
+        BenchmarkQuery(
+            question="What are the requirements for a Permanent Impairment claim?",
+            ground_truth_answer=(
+                "Degree of permanent impairment must be greater than 10%. "
+                "Only one claim can be made for permanent impairment from a specific injury. "
+                "Assessment must be conducted in accordance with the NSW Workers Compensation Guidelines."
+            ),
+            difficulty="medium",
+        ),
+        # Timeframes and Procedures
+        BenchmarkQuery(
+            question="What is the time limit for making a claim?",
+            ground_truth_answer=(
+                "A claim should be made within 6 months after the injury or accident. "
+                "Failure to meet this deadline is not a bar to recovery if delay was due to ignorance, mistake, or other reasonable cause, provided the claim is made within 3 years."
+            ),
+            difficulty="easy",
+        ),
+        BenchmarkQuery(
+            question='What is "Provisional Liability"?',
+            ground_truth_answer=(
+                "Insurers are required to commence provisional weekly payments within 7 days of being notified of an injury. "
+                "This allows payments to start while the insurer is still determining full liability. "
+                "Provisional payments can continue for a period of up to 12 weeks."
+            ),
+            difficulty="medium",
+        ),
+    ]
+
+
+def run_workers_comp_benchmark(pdf_path: Path | None = None):
+    """Run benchmark on Workers Compensation Act 1987."""
+    console.print("\n[bold]Workers Compensation Act 1987 Benchmark[/bold]\n")
+    
+    # Default path
+    if pdf_path is None:
+        pdf_path = Path("rnsr/test-documents/Workers Compensation Act 1987.pdf")
+    
+    if not pdf_path.exists():
+        console.print(f"[red]File not found: {pdf_path}[/red]")
+        console.print("[yellow]Please provide the path with --pdf[/yellow]")
+        return
+    
+    # Read PDF
+    console.print(f"[dim]Loading PDF: {pdf_path}[/dim]")
+    import fitz
+    doc = fitz.open(pdf_path)
+    text = "\n\n".join(page.get_text() for page in doc)
+    console.print(f"[dim]Document: {len(text):,} chars, {len(doc)} pages[/dim]")
+    
+    # Get predefined queries
+    queries = get_workers_comp_queries()
+    console.print(f"[dim]Running {len(queries)} predefined questions[/dim]\n")
+    
+    # Run benchmark (pass None for pdf_path to use text-based ingestion)
+    # This avoids the full PDF pipeline and circular import issues
+    report = run_comparison(text, queries, pdf_path=None)
+    display_report(report)
+    
+    # Show detailed results per question
+    console.print("\n[bold]Detailed Results:[/bold]\n")
+    for r in report.results:
+        if r.method == "rnsr":
+            status = "✓" if r.answer_correctness == 1.0 else "✗"
+            hall = "✓" if r.hallucination_score == 0.0 else "✗"
+            console.print(f"[{'green' if r.answer_correctness == 1.0 else 'red'}]{status}[/] {r.query[:60]}...")
+            console.print(f"   Correct: {r.answer_correctness:.0%} | Grounded: {1-r.hallucination_score:.0%}")
+    
+    # Save report
+    report_path = Path("benchmark_workers_comp_report.json")
+    with open(report_path, "w") as f:
+        json.dump(asdict(report), f, indent=2, default=str)
+    
+    console.print(f"\n[green]📄 Report saved to: {report_path}[/green]")
+
+
+def get_cadell_affidavit_queries() -> list[BenchmarkQuery]:
+    """
+    Predefined Q&A for Affidavit of Simone Cadell.
+    Ground truth answers are the key facts that should be present.
+    """
+    return [
+        BenchmarkQuery(
+            question="When did the mother find out about Mitchell's sunburn?",
+            ground_truth_answer="6 January 2019",
+            difficulty="easy",
+        ),
+        BenchmarkQuery(
+            question="When did the parties get married?",
+            ground_truth_answer="30 March 1996",
+            difficulty="easy",
+        ),
+        BenchmarkQuery(
+            question="When did Lachlan commence seeing a psychologist?",
+            ground_truth_answer="2015",
+            difficulty="easy",
+        ),
+        BenchmarkQuery(
+            question="What incident occurred in July 2014?",
+            ground_truth_answer=(
+                "Father yelled at the children while his friends were over and smacked Lachlan."
+            ),
+            difficulty="medium",
+        ),
+        BenchmarkQuery(
+            question="Did the father ever have suicidal thoughts? If so, when?",
+            ground_truth_answer="Yes, on 15 December 2014 and 16 December 2014.",
+            difficulty="medium",
+        ),
+        BenchmarkQuery(
+            question="What incident occurred at Lachlan's school in 2016?",
+            ground_truth_answer=(
+                "Parties had a meeting with Lachlan's teacher. "
+                "The father requested the school to notify child protection. "
+                "Lachlan's teacher recommended that Lachlan see a psychologist."
+            ),
+            difficulty="medium",
+        ),
+        # Negative test questions - these should NOT be found in the document
+        # A good system should recognize these are not answerable from the document
+        BenchmarkQuery(
+            question="What colour is an orange?",
+            ground_truth_answer="NOT_IN_DOCUMENT",
+            difficulty="easy",
+        ),
+        BenchmarkQuery(
+            question="How many apples did the family buy at the grocery store?",
+            ground_truth_answer="NOT_IN_DOCUMENT",
+            difficulty="easy",
+        ),
+        BenchmarkQuery(
+            question="What was the name of the family's pet dog?",
+            ground_truth_answer="NOT_IN_DOCUMENT",
+            difficulty="easy",
+        ),
+        BenchmarkQuery(
+            question="Which football team does Ross support?",
+            ground_truth_answer="NOT_IN_DOCUMENT",
+            difficulty="medium",
+        ),
+        BenchmarkQuery(
+            question="What recipe did the mother use to make banana bread?",
+            ground_truth_answer="NOT_IN_DOCUMENT",
+            difficulty="easy",
+        ),
+        BenchmarkQuery(
+            question="What was the weather like on Christmas Day 2015?",
+            ground_truth_answer="NOT_IN_DOCUMENT",
+            difficulty="medium",
+        ),
+    ]
+
+
+def run_cadell_affidavit_benchmark(pdf_path: Path | None = None):
+    """Run benchmark on Affidavit of Simone Cadell."""
+    console.print("\n[bold]Affidavit of Simone Cadell Benchmark[/bold]\n")
+    
+    # Default path
+    if pdf_path is None:
+        pdf_path = Path("rnsr/test-documents/19.02.08 Affidavit of Simone Cadell (Version 18) Final Version.pdf")
+    
+    if not pdf_path.exists():
+        console.print(f"[red]File not found: {pdf_path}[/red]")
+        console.print("[yellow]Please provide the path with --pdf[/yellow]")
+        return
+    
+    # Read PDF
+    console.print(f"[dim]Loading PDF: {pdf_path}[/dim]")
+    import fitz
+    doc = fitz.open(pdf_path)
+    text = "\n\n".join(page.get_text() for page in doc)
+    console.print(f"[dim]Document: {len(text):,} chars, {len(doc)} pages[/dim]")
+    
+    # Get predefined queries
+    queries = get_cadell_affidavit_queries()
+    console.print(f"[dim]Running {len(queries)} predefined questions[/dim]\n")
+    
+    # Run benchmark (pass None for pdf_path to use text-based ingestion)
+    report = run_comparison(text, queries, pdf_path=None)
+    display_report(report)
+    
+    # Show detailed results per question
+    console.print("\n[bold]Detailed Results:[/bold]\n")
+    for r in report.results:
+        if r.method == "rnsr":
+            status = "✓" if r.answer_correctness == 1.0 else "✗"
+            hall = "✓" if r.hallucination_score == 0.0 else "✗"
+            console.print(f"[{'green' if r.answer_correctness == 1.0 else 'red'}]{status}[/] {r.query[:60]}...")
+            console.print(f"   Correct: {r.answer_correctness:.0%} | Grounded: {1-r.hallucination_score:.0%}")
+    
+    # Save report
+    report_path = Path("benchmark_cadell_affidavit_report.json")
+    with open(report_path, "w") as f:
+        json.dump(asdict(report), f, indent=2, default=str)
+    
+    console.print(f"\n[green]📄 Report saved to: {report_path}[/green]")
+
+
 def main():
     parser = argparse.ArgumentParser(description="RNSR Comparison Benchmarks")
     parser.add_argument("--pdf", type=Path, help="PDF to benchmark")
     parser.add_argument("--queries", type=Path, help="JSON file with queries")
     parser.add_argument("--quick", action="store_true", help="Quick benchmark with samples")
     parser.add_argument("--large", action="store_true", help="Large document benchmark (shows RNSR advantage)")
+    parser.add_argument("--workers-comp", action="store_true", help="Workers Compensation Act benchmark with predefined Q&A")
+    parser.add_argument("--cadell-affidavit", action="store_true", help="Affidavit of Simone Cadell benchmark with predefined Q&A")
     
     args = parser.parse_args()
     
@@ -989,7 +1250,11 @@ def main():
         border_style="cyan",
     ))
     
-    if args.large:
+    if args.cadell_affidavit:
+        run_cadell_affidavit_benchmark(args.pdf)
+    elif args.workers_comp:
+        run_workers_comp_benchmark(args.pdf)
+    elif args.large:
         run_large_benchmark()
     elif args.quick or (not args.pdf and not args.queries):
         run_quick_benchmark()

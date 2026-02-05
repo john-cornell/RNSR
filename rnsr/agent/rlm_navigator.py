@@ -1393,6 +1393,38 @@ class RLMNavigator:
         self.knowledge_graph = kg
         self.entity_decomposer.set_knowledge_graph(kg)
     
+    def _record_successful_patterns(self, state: "RLMAgentState") -> None:
+        """
+        Record successful query-to-section patterns for learning.
+        
+        This enables the system to learn which section types successfully
+        answer which query types, improving future searches.
+        """
+        try:
+            section_patterns = get_learned_section_patterns()
+            
+            # Get query keywords
+            keywords = state.extracted_keywords or []
+            if not keywords:
+                # Extract basic keywords from question
+                keywords = [w.lower() for w in state.question.split() if len(w) > 3]
+            
+            # Get successful section headers from stored variables
+            successful_headers = []
+            for var_name in state.variables:
+                # Try to find the source node for this variable
+                meta = self.variable_store.get_metadata(var_name)
+                if meta and meta.source_node_id:
+                    node = self.skeleton.get(meta.source_node_id)
+                    if node:
+                        successful_headers.append(node.header)
+            
+            if keywords and successful_headers:
+                section_patterns.record_success(keywords, successful_headers)
+                
+        except Exception as e:
+            logger.warning("failed_to_record_patterns", error=str(e))
+    
     def navigate(
         self,
         question: str,
@@ -1853,6 +1885,7 @@ Generate 2-3 SIMPLE patterns, one per line:"""
         # Reset REPL state
         self.nav_repl.reset()
         self.nav_repl.set_query(query)
+        self.nav_repl.extracted_keywords = keywords  # Sync keywords for learned pattern boosting
         
         # Step 1: Use LLM to generate intelligent search patterns
         llm_patterns = self._llm_generate_search_patterns(query)
@@ -2080,6 +2113,7 @@ Generate 2-3 SIMPLE patterns, one per line:"""
         # Reset and configure NavigationREPL
         self.nav_repl.reset()
         self.nav_repl.set_query(state.current_sub_question or state.question)
+        self.nav_repl.extracted_keywords = state.extracted_keywords or []  # Sync for learned pattern boosting
         
         # Get the system prompt
         system_prompt = self.nav_repl.get_system_prompt()

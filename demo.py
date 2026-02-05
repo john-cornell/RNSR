@@ -69,7 +69,7 @@ client_utils.json_schema_to_python_type = _patched_json_schema_to_python_type_pu
 # =============================================================================
 
 print("Importing RNSR modules...", flush=True)
-from rnsr import ingest_document, build_skeleton_index, run_navigator
+from rnsr import RNSRClient, ingest_document, build_skeleton_index
 from rnsr.models import DocumentTree, DocumentNode
 from rnsr.indexing import KVStore
 from rnsr.indexing.knowledge_graph import KnowledgeGraph, InMemoryKnowledgeGraph
@@ -86,50 +86,108 @@ class SessionState:
         self.kv_store: KVStore | None = None
         self.knowledge_graph: InMemoryKnowledgeGraph | None = None
         self.document_name: str = ""
+        self.document_path: str | None = None  # Track full path for RNSRClient
         self.chat_history: list[tuple[str, str]] = []
         self.entities: list[Entity] = []
         self.extraction_stats: dict[str, Any] = {}
 
 
 state = SessionState()
-print("SessionState created.", flush=True)
+
+# Global RNSRClient instance (uses caching for performance)
+client = RNSRClient(cache_dir=".rnsr_demo_cache")
+print("SessionState and RNSRClient created.", flush=True)
 
 
-def process_document(file, extract_entities: bool = True) -> str:
-    """Process an uploaded PDF document."""
+def process_document(file, extract_entities: bool = True, progress=gr.Progress()):
+    """Process an uploaded PDF document with live status updates."""
+    import time
+    
     if file is None:
-        return "❌ Please upload a PDF file."
+        yield "❌ Please upload a PDF file."
+        return
     
     try:
         # Get the file path
         file_path = file if isinstance(file, str) else file
+        file_name = Path(file_path).name
         
-        # Ingest the document
+        # Store document path for RNSRClient
+        state.document_path = file_path
+        state.document_name = file_name
+        state.chat_history = []
+        
+        # Step 1: Ingest the document
+        yield f"""⏳ **Processing: {file_name}**
+
+📄 Step 1/4: Reading PDF and extracting text..."""
+        
+        progress(0.1, desc="📄 Reading PDF...")
         result = ingest_document(file_path)
         state.tree = result.tree
         
-        # Build the skeleton index
+        # Get document stats early for time estimates
+        node_count = state.tree.total_nodes if state.tree else 0
+        root_sections = len(state.tree.root.children) if state.tree and state.tree.root else 0
+        
+        # Calculate time estimates
+        base_time_sec = 10  # Base processing time
+        entity_time_sec = node_count * 45 if extract_entities else 0  # ~45 sec per node for entity extraction
+        total_est_sec = base_time_sec + entity_time_sec
+        
+        if extract_entities:
+            time_str = f"~{total_est_sec // 60}-{(total_est_sec // 60) + 2} minutes"
+        else:
+            time_str = "~10-30 seconds"
+        
+        # Step 2: Build the skeleton index
+        yield f"""⏳ **Processing: {file_name}**
+
+📄 Step 1/4: ✅ Text extracted
+🌳 Step 2/4: Building document hierarchy...
+
+📊 Found **{node_count} sections** | ⏱️ Est. time: {time_str}"""
+        
+        progress(0.3, desc="🌳 Building hierarchy...")
         state.skeleton, state.kv_store = build_skeleton_index(state.tree)
-        state.document_name = Path(file_path).name
-        state.chat_history = []
         
         # Initialize knowledge graph
         state.knowledge_graph = InMemoryKnowledgeGraph()
         state.entities = []
         state.extraction_stats = {}
         
-        # Get document stats
-        node_count = state.tree.total_nodes if state.tree else 0
-        root_sections = len(state.tree.root.children) if state.tree and state.tree.root else 0
-        
-        # Extract entities if enabled
+        # Step 3: Extract entities if enabled
         entity_info = ""
         if extract_entities and state.tree:
+            start_time = time.time()
+            
+            yield f"""⏳ **Processing: {file_name}**
+
+📄 Step 1/4: ✅ Text extracted
+🌳 Step 2/4: ✅ Hierarchy built ({node_count} nodes)
+🔍 Step 3/4: Extracting entities (0/{node_count} nodes)...
+
+⏱️ **Estimated: {total_est_sec // 60}-{(total_est_sec // 60) + 2} minutes remaining**
+*This step uses AI to identify people, organizations, dates, etc.*"""
+            
             try:
+                progress(0.4, desc=f"🔍 Extracting entities (0/{node_count})...")
                 extraction = extract_entities_from_tree(state.tree)
                 state.entities = extraction.get("entities", [])
                 state.extraction_stats = extraction.get("stats", {})
                 
+                elapsed = int(time.time() - start_time)
+                
+                yield f"""⏳ **Processing: {file_name}**
+
+📄 Step 1/4: ✅ Text extracted
+🌳 Step 2/4: ✅ Hierarchy built ({node_count} nodes)
+🔍 Step 3/4: ✅ Entities extracted ({len(state.entities)} found in {elapsed}s)
+🔗 Step 4/4: Building knowledge graph...
+
+⏱️ **Almost done...**"""
+                
+                progress(0.8, desc="🔗 Building knowledge graph...")
                 # Store entities in knowledge graph
                 for entity in state.entities:
                     state.knowledge_graph.add_entity(entity)
@@ -147,36 +205,86 @@ def process_document(file, extract_entities: bool = True) -> str:
                 
             except Exception as e:
                 entity_info = f"\n⚠️ Entity extraction skipped: {str(e)[:50]}"
+        else:
+            yield f"""⏳ **Processing: {file_name}**
+
+📄 Step 1/4: ✅ Text extracted
+🌳 Step 2/4: ✅ Hierarchy built ({node_count} nodes)
+⚡ Step 3/4: Preparing for Q&A...
+
+⏱️ **Almost done...**"""
         
-        return f"""✅ **Document processed successfully!**
+        # Step 4: Pre-warm the RNSRClient cache
+        progress(0.9, desc="⚡ Preparing for questions...")
+        try:
+            client._get_or_create_index(Path(file_path), force_reindex=False)
+        except Exception:
+            pass  # Non-critical, will be created on first question
+        
+        progress(1.0, desc="✅ Ready!")
+        
+        # Final success message
+        if extract_entities and state.entities:
+            yield f"""✅ **Document ready for questions!**
 
 📄 **File:** {state.document_name}
 🌳 **Hierarchy nodes:** {node_count}
 📊 **Root sections:** {root_sections}{entity_info}
 
-You can now ask questions about this document in the chat below."""
+💬 **Ask questions in the chat below.** Entity visualization available in the tabs."""
+        else:
+            yield f"""✅ **Document ready for questions!**
+
+📄 **File:** {state.document_name}
+🌳 **Hierarchy nodes:** {node_count}
+📊 **Root sections:** {root_sections}
+
+💬 **Ask questions in the chat below.**
+*The AI will extract entities on-the-fly for accurate answers.*"""
         
     except Exception as e:
         import traceback
-        return f"❌ Error processing document: {str(e)}\n\n```\n{traceback.format_exc()}\n```"
+        yield f"❌ Error processing document: {str(e)}\n\n```\n{traceback.format_exc()}\n```"
 
 
-def chat(message: str, history: list) -> tuple[str, list]:
+def chat(message: str, history: list, progress=gr.Progress()) -> tuple[str, list]:
     """Handle a chat message and return the response."""
-    if state.skeleton is None or state.kv_store is None:
+    if state.document_path is None:
         return "", history + [
             {"role": "user", "content": message},
-            {"role": "assistant", "content": "❌ Please upload a document first before asking questions."}
+            {"role": "assistant", "content": "❌ Please upload and process a document first using the 'Process Document' button."}
         ]
     
     if not message.strip():
         return "", history
     
     try:
-        # Check if this is an entity-related query and we have entities
-        entity_context = ""
+        progress(0.2, desc="🔍 Searching document...")
+        
+        # Use RNSRClient.ask_advanced() with knowledge graph for best accuracy
+        # This matches the benchmark's zero-hallucination performance
+        progress(0.4, desc="🧠 Analyzing relevant sections...")
+        result = client.ask_advanced(
+            document=state.document_path,
+            question=message,
+            use_knowledge_graph=True,   # Entity extraction for better accuracy
+            enable_verification=False,  # Avoid overly strict critic
+        )
+        
+        progress(0.8, desc="✍️ Generating answer...")
+        
+        # Format the response
+        answer = result.get("answer", str(result))
+        confidence = result.get("confidence", None)
+        
+        # Build response with confidence if available
+        if confidence is not None:
+            response = f"{answer}\n\n*Confidence: {confidence:.0%}*"
+        else:
+            response = str(answer)
+        
+        # Add entity context from local knowledge graph if available
         if state.knowledge_graph and state.entities:
-            # Search for mentioned entities in the query
             mentioned_entities = []
             query_lower = message.lower()
             
@@ -189,34 +297,18 @@ def chat(message: str, history: list) -> tuple[str, list]:
                             mentioned_entities.append(entity)
                             break
             
-            # If we found entities, add context
             if mentioned_entities:
                 context_parts = []
                 for entity in mentioned_entities[:3]:
-                    # Get related entities
                     co_mentions = state.knowledge_graph.get_entities_mentioned_together(entity.id)
                     related = [e.canonical_name for e, _ in co_mentions[:3]]
-                    
                     context_parts.append(
                         f"- {entity.canonical_name} ({entity.type.value})"
                         + (f", related to: {', '.join(related)}" if related else "")
                     )
-                
-                entity_context = "\n\n*Entity context:*\n" + "\n".join(context_parts)
+                response += "\n\n*Entity context:*\n" + "\n".join(context_parts)
         
-        # Run the navigator agent
-        answer = run_navigator(
-            question=message,
-            skeleton=state.skeleton,
-            kv_store=state.kv_store
-        )
-        
-        # Format the response
-        response = str(answer)
-        
-        # Append entity context if available
-        if entity_context:
-            response += entity_context
+        progress(1.0, desc="✅ Done")
         
         # Update history with Gradio 6.x message format
         new_history = history + [
@@ -229,7 +321,7 @@ def chat(message: str, history: list) -> tuple[str, list]:
         
     except Exception as e:
         import traceback
-        error_msg = f"❌ Error: {str(e)}"
+        error_msg = f"❌ Error: {str(e)}\n\n```\n{traceback.format_exc()}\n```"
         return "", history + [
             {"role": "user", "content": message},
             {"role": "assistant", "content": error_msg}
@@ -272,6 +364,12 @@ def _visualize_node(node: DocumentNode, lines: list, prefix: str, is_last: bool)
 def get_entities_visualization() -> str:
     """Generate a visualization of extracted entities."""
     if not state.entities:
+        if state.document_path:
+            return """**No entities extracted for visualization.**
+
+To see entities here, re-process the document with "Extract entities" enabled.
+
+*Note: Q&A still works - the AI extracts entities on-the-fly when answering questions.*"""
         return "No entities extracted. Process a document first."
     
     lines = []
@@ -323,7 +421,13 @@ def get_entities_visualization() -> str:
 
 def get_relationships_visualization() -> str:
     """Generate a visualization of entity relationships."""
-    if not state.knowledge_graph:
+    if not state.knowledge_graph or not state.entities:
+        if state.document_path:
+            return """**No relationships extracted for visualization.**
+
+To see relationships here, re-process the document with "Extract entities" enabled.
+
+*Note: Q&A still works - the AI builds its own knowledge graph when answering questions.*"""
         return "No knowledge graph available. Process a document first."
     
     stats = state.knowledge_graph.get_stats()
@@ -400,104 +504,199 @@ def search_entities(query: str) -> str:
 
 print("All functions defined.", flush=True)
 
+# Example questions users can click
+EXAMPLE_QUESTIONS = [
+    "What are the main sections of this document?",
+    "Who are the key people mentioned?",
+    "Summarize the key findings",
+    "What dates are mentioned?",
+]
+
+
 # Create the Gradio interface
 def create_demo():
     print("Creating demo...", flush=True)
     print("Creating gr.Blocks...", flush=True)
-    with gr.Blocks(title="RNSR - Document Q&A") as demo:
+    
+    # Use a modern theme
+    theme = gr.themes.Soft(
+        primary_hue="blue",
+        secondary_hue="slate",
+        neutral_hue="slate",
+        font=gr.themes.GoogleFont("Inter"),
+    ).set(
+        block_title_text_weight="600",
+        block_border_width="1px",
+        block_shadow="0 1px 3px rgba(0,0,0,0.1)",
+        button_primary_background_fill="*primary_500",
+        button_primary_background_fill_hover="*primary_600",
+    )
+    
+    with gr.Blocks(
+        title="RNSR - Document Q&A",
+        theme=theme,
+        css="""
+            .main-header { text-align: center; margin-bottom: 1rem; }
+            .status-card { 
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                border-radius: 12px;
+                padding: 1rem;
+                color: white;
+            }
+            .example-btn { font-size: 0.85rem !important; }
+            footer { text-align: center; opacity: 0.7; font-size: 0.85rem; margin-top: 2rem; }
+        """
+    ) as demo:
         print("Inside gr.Blocks context...", flush=True)
+        
+        # Header
         gr.Markdown("""
-        # 🔍 RNSR - Recursive Neural-Symbolic Retriever
+        <div class="main-header">
         
-        Upload a PDF document and ask questions about it. RNSR preserves the document's 
-        hierarchical structure and extracts entities for better context understanding.
+        # 🔍 RNSR - Document Q&A
+        ### Recursive Neural-Symbolic Retriever with Knowledge Graph
         
-        **Features:**
-        - 📊 Hierarchical document structure extraction
-        - 🔍 Entity extraction (people, organizations, dates, etc.)
-        - 🔗 Relationship mapping between entities
-        - 💬 Natural language Q&A with structural context
+        </div>
         """)
         
+        # Quick start steps
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("### 📄 Document Upload")
-                file_input = gr.File(
-                    label="Upload PDF",
-                    file_types=[".pdf"],
-                    type="filepath"
-                )
-                extract_entities_cb = gr.Checkbox(
-                    label="Extract entities",
-                    value=True,
-                    info="Enable entity and relationship extraction"
-                )
-                process_btn = gr.Button("🔄 Process Document", variant="primary")
-                status_output = gr.Markdown("*No document loaded*")
+                gr.Markdown("**Step 1:** Upload PDF")
+            with gr.Column(scale=1):
+                gr.Markdown("**Step 2:** Click Process")
+            with gr.Column(scale=1):
+                gr.Markdown("**Step 3:** Ask Questions")
+        
+        gr.Markdown("---")
+        
+        with gr.Row(equal_height=False):
+            # Left column - Document & Settings
+            with gr.Column(scale=1, min_width=320):
+                with gr.Group():
+                    gr.Markdown("### 📄 Document")
+                    file_input = gr.File(
+                        label="Upload PDF",
+                        file_types=[".pdf"],
+                        type="filepath",
+                        file_count="single",
+                    )
+                    process_btn = gr.Button(
+                        "🚀 Process Document", 
+                        variant="primary",
+                        size="lg",
+                    )
                 
+                # Status card
+                status_output = gr.Markdown("""
+**Status:** Waiting for document...
+
+Upload a PDF above and click **Process Document** to begin.
+""")
+                
+                # Advanced options in accordion
+                with gr.Accordion("⚙️ Advanced Options", open=False):
+                    extract_entities_cb = gr.Checkbox(
+                        label="Extract entities for visualization",
+                        value=False,
+                        info="Adds 5-10 min. Not needed for Q&A."
+                    )
+                    gr.Markdown("*Entity extraction runs AI on each section for the visualization tabs. Q&A works without this.*")
+                
+                # Document info tabs
                 with gr.Tabs():
                     with gr.TabItem("🌳 Structure"):
                         tree_output = gr.Textbox(
                             label="Document Hierarchy",
-                            lines=12,
-                            max_lines=25,
-                            interactive=False
+                            lines=10,
+                            max_lines=20,
+                            interactive=False,
+                            show_label=False,
+                            placeholder="Process a document to see its structure..."
                         )
-                        refresh_tree_btn = gr.Button("Refresh", size="sm")
+                        refresh_tree_btn = gr.Button("🔄 Refresh", size="sm")
                     
                     with gr.TabItem("🔍 Entities"):
-                        entities_output = gr.Markdown("*Process a document to see entities*")
-                        refresh_entities_btn = gr.Button("Refresh", size="sm")
+                        entities_output = gr.Markdown("*Process a document with entity extraction enabled to see entities*")
+                        refresh_entities_btn = gr.Button("🔄 Refresh", size="sm")
                     
                     with gr.TabItem("🔗 Relationships"):
-                        relationships_output = gr.Markdown("*Process a document to see relationships*")
-                        refresh_rels_btn = gr.Button("Refresh", size="sm")
+                        relationships_output = gr.Markdown("*Process a document with entity extraction enabled to see relationships*")
+                        refresh_rels_btn = gr.Button("🔄 Refresh", size="sm")
                     
                     with gr.TabItem("🔎 Search"):
                         entity_search = gr.Textbox(
                             label="Search entities",
                             placeholder="Enter name to search...",
+                            show_label=False,
                         )
-                        search_btn = gr.Button("Search", size="sm")
+                        search_btn = gr.Button("🔍 Search", size="sm")
                         search_results = gr.Markdown("")
             
-            with gr.Column(scale=2):
-                gr.Markdown("### 💬 Chat with your Document")
+            # Right column - Chat
+            with gr.Column(scale=2, min_width=400):
+                gr.Markdown("### 💬 Ask Questions")
+                
                 chatbot = gr.Chatbot(
                     label="Conversation",
-                    height=450,
+                    height=400,
                     show_label=False,
+                    placeholder="📄 Upload and process a document first, then ask questions here...",
+                    avatar_images=(None, "https://api.dicebear.com/7.x/bottts/svg?seed=rnsr"),
+                    show_copy_button=True,
                 )
                 
+                # Example questions as clickable buttons
+                gr.Markdown("**Try an example:**")
+                with gr.Row():
+                    example_btns = []
+                    for i, q in enumerate(EXAMPLE_QUESTIONS):
+                        btn = gr.Button(
+                            q[:35] + "..." if len(q) > 35 else q,
+                            size="sm",
+                            variant="secondary",
+                            elem_classes=["example-btn"]
+                        )
+                        example_btns.append((btn, q))
+                
+                # Chat input
                 with gr.Row():
                     msg_input = gr.Textbox(
                         label="Your question",
-                        placeholder="Ask a question about the document...",
-                        scale=4,
-                        show_label=False
+                        placeholder="Type your question here...",
+                        scale=5,
+                        show_label=False,
+                        container=False,
                     )
-                    submit_btn = gr.Button("Send", variant="primary", scale=1)
+                    submit_btn = gr.Button("➤ Send", variant="primary", scale=1, min_width=100)
                 
-                clear_btn = gr.Button("🗑️ Clear Chat")
+                with gr.Row():
+                    clear_btn = gr.Button("🗑️ Clear Chat", size="sm", variant="secondary")
         
+        # Footer
         gr.Markdown("""
-        ---
-        ### Example Questions
-        - "What are the main sections of this document?"
-        - "Who are the key people mentioned?"
-        - "What happened on [specific date]?"
-        - "What is the relationship between [Person A] and [Organization B]?"
-        - "Summarize the key findings"
+        <footer>
         
         ---
-        *Powered by RNSR with Ontological Entity Understanding - [GitHub](https://github.com/theeufj/RNSR)*
+        **RNSR** - Recursive Neural-Symbolic Retriever | 
+        [GitHub](https://github.com/theeufj/RNSR) | 
+        Built with knowledge graph extraction for accurate, grounded answers
+        
+        </footer>
         """)
         
         # Event handlers
+        
+        # Process document and auto-refresh structure
+        def process_and_refresh(file, extract_entities):
+            """Process document and return both status and tree."""
+            for status in process_document(file, extract_entities):
+                yield status, get_tree_visualization()
+        
         process_btn.click(
-            fn=process_document,
+            fn=process_and_refresh,
             inputs=[file_input, extract_entities_cb],
-            outputs=[status_output]
+            outputs=[status_output, tree_output]
         )
         
         refresh_tree_btn.click(
@@ -529,6 +728,18 @@ def create_demo():
             inputs=[entity_search],
             outputs=[search_results]
         )
+        
+        # Example question buttons - fill input and submit
+        def use_example(question):
+            """Put example question in input box."""
+            return question
+        
+        for btn, question in example_btns:
+            btn.click(
+                fn=lambda q=question: q,
+                inputs=[],
+                outputs=[msg_input]
+            )
         
         msg_input.submit(
             fn=chat,

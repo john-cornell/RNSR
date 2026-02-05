@@ -202,6 +202,7 @@ def calculate_specificity_score(
     depth: int,
     header: str,
     summary_matches: int = 0,
+    query_keywords: list[str] | None = None,
 ) -> float:
     """
     Calculate a specificity-aware relevance score.
@@ -210,6 +211,7 @@ def calculate_specificity_score(
     - Sections with header matches (more specific)
     - Deeper sections (more focused content)
     - Sections with higher match density
+    - Sections that historically answered similar queries (learned patterns)
     
     And penalizes:
     - Very long content (broad container sections)
@@ -222,6 +224,7 @@ def calculate_specificity_score(
         depth: Depth from search starting point
         header: The section header text
         summary_matches: Number of regex matches in summary
+        query_keywords: Optional list of query keywords for learned pattern boosting
         
     Returns:
         Relevance score (higher = more relevant)
@@ -266,9 +269,27 @@ def calculate_specificity_score(
     is_definitional = bool(header_words & DEFINITIONAL_HEADERS)
     definitional_bonus = 0.5 if is_definitional else 0.0  # 50% bonus for definitional sections
     
+    # Check for learned pattern bonus (sections that historically answered similar queries)
+    learned_bonus = 0.0
+    if query_keywords:
+        try:
+            # Import locally to avoid circular import
+            from rnsr.agent.rlm_navigator import get_learned_section_patterns
+            section_patterns = get_learned_section_patterns()
+            boosted_words = section_patterns.get_boosted_header_words(query_keywords)
+            if boosted_words and (header_words & boosted_words):
+                learned_bonus = 0.4  # 40% bonus for sections that historically worked
+                logger.debug(
+                    "learned_pattern_boost_applied",
+                    header=header,
+                    boosted_words=list(boosted_words & header_words),
+                )
+        except Exception:
+            pass  # Don't let learning failures affect scoring
+    
     # Final score calculation
     # Base score adjusted by penalties and bonuses
-    adjusted_score = base_score * (1.0 - length_penalty - catch_all_penalty) * (1.0 + depth_bonus + definitional_bonus)
+    adjusted_score = base_score * (1.0 - length_penalty - catch_all_penalty) * (1.0 + depth_bonus + definitional_bonus + learned_bonus)
     
     # Add density bonus (rewards focused matches)
     final_score = adjusted_score + (match_density * 0.5)
@@ -314,6 +335,7 @@ class NavigationREPL:
     # Navigation state
     current_node_id: str = "root"
     query: str = ""
+    extracted_keywords: list[str] = field(default_factory=list)
     navigation_history: list[str] = field(default_factory=list)
     
     # Storage for findings
@@ -612,6 +634,7 @@ class NavigationREPL:
                     depth=1,  # Direct children are depth 1
                     header=child.header,
                     summary_matches=summary_matches,
+                    query_keywords=self.extracted_keywords,
                 )
                 
                 # Get first match as preview
@@ -695,6 +718,7 @@ class NavigationREPL:
                     content_length=len(content),
                     depth=depth,
                     header=node.header,
+                    query_keywords=self.extracted_keywords,
                 )
                 
                 results.append({
