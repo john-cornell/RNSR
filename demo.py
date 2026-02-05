@@ -502,6 +502,176 @@ def search_entities(query: str) -> str:
     return "\n".join(lines)
 
 
+def get_tables_list() -> str:
+    """List all detected tables in the document."""
+    if not state.document_path:
+        return "No document loaded. Upload and process a document first."
+    
+    try:
+        tables = client.list_tables(state.document_path)
+        
+        if not tables:
+            return """**No tables detected in this document.**
+
+Tables are automatically detected during document processing. This document may not contain any structured tables, or the tables may not be in a recognizable format (markdown/ASCII).
+
+*Tip: Tables work best when they use consistent formatting with headers and delimiters.*"""
+        
+        lines = [f"## 📊 Detected Tables ({len(tables)} found)\n"]
+        
+        for i, table in enumerate(tables, 1):
+            headers_str = ", ".join(table["headers"][:5])
+            if len(table["headers"]) > 5:
+                headers_str += f" ... (+{len(table['headers']) - 5} more)"
+            
+            lines.append(f"### {i}. {table.get('title') or f'Table {table['id']}'}")
+            lines.append(f"- **ID:** `{table['id']}`")
+            lines.append(f"- **Rows:** {table['num_rows']} | **Columns:** {table['num_cols']}")
+            lines.append(f"- **Headers:** {headers_str}")
+            if table.get("page_num"):
+                lines.append(f"- **Page:** {table['page_num']}")
+            lines.append("")
+        
+        lines.append("\n*Use the Table Query tab to run SQL-like queries on these tables.*")
+        
+        return "\n".join(lines)
+        
+    except Exception as e:
+        return f"Error listing tables: {str(e)}"
+
+
+def get_table_dropdown_choices() -> list[str]:
+    """Get table IDs for dropdown."""
+    if not state.document_path:
+        return []
+    
+    try:
+        tables = client.list_tables(state.document_path)
+        return [f"{t['id']} - {t.get('title') or 'Untitled'} ({t['num_rows']} rows)" for t in tables]
+    except Exception:
+        return []
+
+
+def query_table_ui(
+    table_selection: str,
+    columns: str,
+    where_column: str,
+    where_op: str,
+    where_value: str,
+    order_by: str,
+    limit: int,
+) -> str:
+    """Run a SQL-like query on a table."""
+    if not state.document_path:
+        return "No document loaded. Upload and process a document first."
+    
+    if not table_selection:
+        return "Please select a table from the dropdown."
+    
+    try:
+        # Extract table ID from selection (format: "table_001 - Title (N rows)")
+        table_id = table_selection.split(" - ")[0].strip()
+        
+        # Parse columns
+        cols = None
+        if columns.strip():
+            cols = [c.strip() for c in columns.split(",") if c.strip()]
+        
+        # Parse where clause
+        where = None
+        if where_column.strip() and where_value.strip():
+            if where_op in ("==", "!=", ">", ">=", "<", "<="):
+                # Try numeric conversion
+                try:
+                    val = float(where_value.replace(",", "").replace("$", "").strip())
+                    where = {where_column.strip(): {"op": where_op, "value": val}}
+                except ValueError:
+                    where = {where_column.strip(): {"op": where_op, "value": where_value}}
+            elif where_op == "contains":
+                where = {where_column.strip(): {"op": "contains", "value": where_value}}
+            else:
+                where = {where_column.strip(): where_value}
+        
+        # Parse order by
+        order = None
+        if order_by.strip():
+            order = order_by.strip()
+        
+        # Parse limit
+        lim = limit if limit > 0 else None
+        
+        # Run query
+        results = client.query_table(
+            document=state.document_path,
+            table_id=table_id,
+            columns=cols,
+            where=where,
+            order_by=order,
+            limit=lim,
+        )
+        
+        if not results:
+            return f"**Query returned 0 rows.**\n\nTable: `{table_id}`"
+        
+        # Format as markdown table
+        lines = [f"### Query Results ({len(results)} rows)\n"]
+        
+        # Get headers from first row
+        headers = list(results[0].keys())
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        
+        for row in results:
+            values = [str(row.get(h, ""))[:50] for h in headers]  # Truncate long values
+            lines.append("| " + " | ".join(values) + " |")
+        
+        return "\n".join(lines)
+        
+    except Exception as e:
+        import traceback
+        return f"**Query Error:** {str(e)}\n\n```\n{traceback.format_exc()}\n```"
+
+
+def run_aggregation(table_selection: str, column: str, operation: str) -> str:
+    """Run an aggregation on a table column."""
+    if not state.document_path:
+        return "No document loaded."
+    
+    if not table_selection or not column.strip() or not operation:
+        return "Please select a table, column, and operation."
+    
+    try:
+        table_id = table_selection.split(" - ")[0].strip()
+        
+        result = client.aggregate_table(
+            document=state.document_path,
+            table_id=table_id,
+            column=column.strip(),
+            operation=operation,
+        )
+        
+        # Format nicely based on operation
+        op_names = {
+            "sum": "Sum",
+            "avg": "Average",
+            "count": "Count",
+            "min": "Minimum",
+            "max": "Maximum",
+        }
+        
+        if operation == "avg":
+            formatted = f"{result:,.2f}"
+        elif isinstance(result, float) and result == int(result):
+            formatted = f"{int(result):,}"
+        else:
+            formatted = f"{result:,.2f}" if isinstance(result, float) else str(result)
+        
+        return f"### {op_names.get(operation, operation)} of `{column}`\n\n# {formatted}"
+        
+    except Exception as e:
+        return f"**Aggregation Error:** {str(e)}"
+
+
 print("All functions defined.", flush=True)
 
 # Example questions users can click
@@ -632,19 +802,24 @@ Upload a PDF above and click **Process Document** to begin.
                         )
                         search_btn = gr.Button("🔍 Search", size="sm")
                         search_results = gr.Markdown("")
+                    
+                    with gr.TabItem("📊 Tables"):
+                        tables_output = gr.Markdown("*Process a document to detect tables*")
+                        refresh_tables_btn = gr.Button("🔄 Refresh Tables", size="sm")
             
-            # Right column - Chat
+            # Right column - Chat & Tables
             with gr.Column(scale=2, min_width=400):
-                gr.Markdown("### 💬 Ask Questions")
-                
-                chatbot = gr.Chatbot(
-                    label="Conversation",
-                    height=400,
-                    show_label=False,
-                    placeholder="📄 Upload and process a document first, then ask questions here...",
-                    avatar_images=(None, "https://api.dicebear.com/7.x/bottts/svg?seed=rnsr"),
-                    show_copy_button=True,
-                )
+                with gr.Tabs():
+                    # Chat Tab
+                    with gr.TabItem("💬 Chat"):
+                        chatbot = gr.Chatbot(
+                            label="Conversation",
+                            height=350,
+                            show_label=False,
+                            placeholder="📄 Upload and process a document first, then ask questions here...",
+                            avatar_images=(None, "https://api.dicebear.com/7.x/bottts/svg?seed=rnsr"),
+                            show_copy_button=True,
+                        )
                 
                 # Example questions as clickable buttons
                 gr.Markdown("**Try an example:**")
@@ -670,8 +845,64 @@ Upload a PDF above and click **Process Document** to begin.
                     )
                     submit_btn = gr.Button("➤ Send", variant="primary", scale=1, min_width=100)
                 
-                with gr.Row():
-                    clear_btn = gr.Button("🗑️ Clear Chat", size="sm", variant="secondary")
+                        with gr.Row():
+                            clear_btn = gr.Button("🗑️ Clear Chat", size="sm", variant="secondary")
+                    
+                    # Table Query Tab
+                    with gr.TabItem("📊 Table Query"):
+                        gr.Markdown("### SQL-like Table Queries")
+                        gr.Markdown("*Query detected tables with SELECT, WHERE, ORDER BY, and aggregations.*")
+                        
+                        with gr.Row():
+                            table_dropdown = gr.Dropdown(
+                                label="Select Table",
+                                choices=[],
+                                interactive=True,
+                                scale=2,
+                            )
+                            refresh_dropdown_btn = gr.Button("🔄", size="sm", scale=0)
+                        
+                        with gr.Accordion("Query Options", open=True):
+                            columns_input = gr.Textbox(
+                                label="Columns (comma-separated, leave empty for all)",
+                                placeholder="Name, Amount, Date",
+                            )
+                            
+                            with gr.Row():
+                                where_col = gr.Textbox(label="Where Column", placeholder="Amount", scale=1)
+                                where_op = gr.Dropdown(
+                                    label="Operator",
+                                    choices=["==", "!=", ">", ">=", "<", "<=", "contains"],
+                                    value=">=",
+                                    scale=1,
+                                )
+                                where_val = gr.Textbox(label="Value", placeholder="1000", scale=1)
+                            
+                            with gr.Row():
+                                order_input = gr.Textbox(
+                                    label="Order By (prefix with - for DESC)",
+                                    placeholder="-Amount",
+                                    scale=2,
+                                )
+                                limit_input = gr.Number(label="Limit", value=10, precision=0, scale=1)
+                        
+                        query_btn = gr.Button("▶ Run Query", variant="primary")
+                        query_results = gr.Markdown("*Select a table and run a query to see results*")
+                        
+                        gr.Markdown("---")
+                        gr.Markdown("### Aggregations")
+                        
+                        with gr.Row():
+                            agg_col = gr.Textbox(label="Column", placeholder="Revenue", scale=2)
+                            agg_op = gr.Dropdown(
+                                label="Operation",
+                                choices=["sum", "avg", "count", "min", "max"],
+                                value="sum",
+                                scale=1,
+                            )
+                            agg_btn = gr.Button("▶ Calculate", variant="secondary", scale=1)
+                        
+                        agg_result = gr.Markdown("")
         
         # Footer
         gr.Markdown("""
@@ -689,14 +920,17 @@ Upload a PDF above and click **Process Document** to begin.
         
         # Process document and auto-refresh structure
         def process_and_refresh(file, extract_entities):
-            """Process document and return both status and tree."""
+            """Process document and return status, tree, tables, and dropdown choices."""
             for status in process_document(file, extract_entities):
-                yield status, get_tree_visualization()
+                tables_list = get_tables_list()
+                dropdown_choices = get_table_dropdown_choices()
+                dropdown_update = gr.update(choices=dropdown_choices, value=dropdown_choices[0] if dropdown_choices else None)
+                yield status, get_tree_visualization(), tables_list, dropdown_update
         
         process_btn.click(
             fn=process_and_refresh,
             inputs=[file_input, extract_entities_cb],
-            outputs=[status_output, tree_output]
+            outputs=[status_output, tree_output, tables_output, table_dropdown]
         )
         
         refresh_tree_btn.click(
@@ -727,6 +961,35 @@ Upload a PDF above and click **Process Document** to begin.
             fn=search_entities,
             inputs=[entity_search],
             outputs=[search_results]
+        )
+        
+        refresh_tables_btn.click(
+            fn=get_tables_list,
+            inputs=[],
+            outputs=[tables_output]
+        )
+        
+        # Table query handlers
+        def update_table_dropdown():
+            choices = get_table_dropdown_choices()
+            return gr.update(choices=choices, value=choices[0] if choices else None)
+        
+        refresh_dropdown_btn.click(
+            fn=update_table_dropdown,
+            inputs=[],
+            outputs=[table_dropdown]
+        )
+        
+        query_btn.click(
+            fn=query_table_ui,
+            inputs=[table_dropdown, columns_input, where_col, where_op, where_val, order_input, limit_input],
+            outputs=[query_results]
+        )
+        
+        agg_btn.click(
+            fn=run_aggregation,
+            inputs=[table_dropdown, agg_col, agg_op],
+            outputs=[agg_result]
         )
         
         # Example question buttons - fill input and submit

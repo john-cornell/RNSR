@@ -112,6 +112,32 @@ class SkeletonNode(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class DetectedTable(BaseModel):
+    """Lightweight representation of a detected table for storage."""
+    
+    id: str
+    node_id: str  # Source node containing this table
+    page_num: int | None = None
+    title: str = ""
+    headers: list[str] = Field(default_factory=list)
+    num_rows: int = 0
+    num_cols: int = 0
+    # Store raw data as list of rows (each row is list of cell values)
+    data: list[list[str]] = Field(default_factory=list)
+    
+    def to_query_format(self) -> dict:
+        """Convert to format suitable for TableQueryEngine."""
+        return {
+            "id": self.id,
+            "node_id": self.node_id,
+            "page_num": self.page_num,
+            "title": self.title,
+            "headers": self.headers,
+            "num_rows": self.num_rows,
+            "num_cols": self.num_cols,
+        }
+
+
 class IngestionResult(BaseModel):
     """Result of document ingestion including metadata."""
 
@@ -120,6 +146,7 @@ class IngestionResult(BaseModel):
     method: IngestionMethod
     warnings: list[str] = Field(default_factory=list)
     stats: dict[str, Any] = Field(default_factory=dict)
+    tables: list[DetectedTable] = Field(default_factory=list)  # Auto-detected tables
 
 
 # =============================================================================

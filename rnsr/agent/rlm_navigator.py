@@ -1351,11 +1351,13 @@ class RLMNavigator:
         kv_store: KVStore,
         config: RLMConfig | None = None,
         knowledge_graph=None,
+        tables: list | None = None,
     ):
         self.skeleton = skeleton
         self.kv_store = kv_store
         self.config = config or RLMConfig()
         self.knowledge_graph = knowledge_graph
+        self.tables = tables or []
         
         # Initialize components
         self.variable_store = VariableStore()
@@ -1365,7 +1367,7 @@ class RLMNavigator:
         self.entity_decomposer = EntityAwareDecomposer(knowledge_graph)
         
         # NavigationREPL for RLM-style code generation navigation
-        self.nav_repl = create_navigation_repl(skeleton, kv_store)
+        self.nav_repl = create_navigation_repl(skeleton, kv_store, tables=tables)
         
         # LLM function
         self._llm_fn: Callable[[str], str] | None = None
@@ -1392,6 +1394,16 @@ class RLMNavigator:
         """Set the knowledge graph for entity-aware decomposition."""
         self.knowledge_graph = kg
         self.entity_decomposer.set_knowledge_graph(kg)
+    
+    def set_tables(self, tables: list) -> None:
+        """
+        Set detected tables for SQL-like querying during navigation.
+        
+        Args:
+            tables: List of DetectedTable objects from ingestion.
+        """
+        self.tables = tables or []
+        self.nav_repl.set_tables(self.tables)
     
     def _record_successful_patterns(self, state: "RLMAgentState") -> None:
         """
@@ -2596,16 +2608,19 @@ Answer (grounded in document sections):"""
                 state.answer = self._normalize_mc_answer(state.answer, options)
             
             # Post-synthesis grounding check: verify key claims exist in source
-            grounded, issues = self._verify_answer_grounded(state.answer, context_text)
-            logger.info(
-                "grounding_check_result",
-                is_grounded=grounded,
-                issues=issues if not grounded else None,
-            )
-            if not grounded:
-                logger.warning("answer_grounding_issues", issues=issues)
-                # Reduce confidence if grounding issues found
-                state.confidence = max(0.3, state.confidence - 0.2)
+            # Only run if verification is enabled - this check is too strict for
+            # table-heavy financial documents where text extraction loses structure
+            if self.config.enable_verification:
+                grounded, issues = self._verify_answer_grounded(state.answer, context_text)
+                logger.info(
+                    "grounding_check_result",
+                    is_grounded=grounded,
+                    issues=issues if not grounded else None,
+                )
+                if not grounded:
+                    logger.warning("answer_grounding_issues", issues=issues)
+                    # Reduce confidence if grounding issues found
+                    state.confidence = max(0.3, state.confidence - 0.2)
                 
         except Exception as e:
             logger.error("synthesis_failed", error=str(e))

@@ -43,7 +43,7 @@ from rnsr.ingestion.layout_detector import detect_layout_complexity
 from rnsr.ingestion.ocr_fallback import has_extractable_text, try_ocr_ingestion
 from rnsr.ingestion.semantic_fallback import try_semantic_splitter_ingestion
 from rnsr.ingestion.tree_builder import build_document_tree, build_multi_document_tree
-from rnsr.models import DocumentNode, DocumentTree, IngestionResult
+from rnsr.models import DetectedTable, DocumentNode, DocumentTree, IngestionResult
 
 logger = structlog.get_logger(__name__)
 
@@ -106,13 +106,14 @@ def ingest_document(
         # Try pattern-based header detection first
         tree = _try_pattern_based_headers(text, pdf_path.stem)
         if tree:
-            return IngestionResult(
+            result = IngestionResult(
                 tree=tree,
                 tier_used=2,  # Pattern-based is a sub-tier of tier 2
                 method="pattern_based_headers",
                 stats=stats,
                 warnings=warnings,
             )
+            return _add_tables_to_result(result)
         
         # Fallback: create a simple tree from the text
         root = DocumentNode(id="root", level=0, header=pdf_path.stem, content=text)
@@ -123,13 +124,14 @@ def ingest_document(
             ingestion_tier=2,
             ingestion_method="semantic_splitter",
         )
-        return IngestionResult(
+        result = IngestionResult(
             tree=tree,
             tier_used=2,
             method="semantic_splitter",
             stats=stats,
             warnings=warnings,
         )
+        return _add_tables_to_result(result)
     
     # Check if document has extractable text
     if not has_extractable_text(pdf_path):
@@ -213,13 +215,14 @@ def _try_tier_1b_visual(
             nodes=tree.total_nodes,
         )
         
-        return IngestionResult(
+        result = IngestionResult(
             tree=tree,
             tier_used=1,
             method="layoutlm_xycut",
             warnings=warnings,
             stats=stats,
         )
+        return _add_tables_to_result(result)
         
     except Exception as e:
         logger.warning("tier_1b_visual_failed", path=str(pdf_path), error=str(e))
@@ -295,13 +298,14 @@ def _try_tier_1(
                     documents=len(segments),
                 )
                 
-                return IngestionResult(
+                result = IngestionResult(
                     tree=tree,
                     tier_used=1,
                     method="font_histogram",
                     warnings=warnings,
                     stats=stats,
                 )
+                return _add_tables_to_result(result)
         
         # Single document: standard processing
         # Classify spans
@@ -321,13 +325,14 @@ def _try_tier_1(
             nodes=tree.total_nodes,
         )
         
-        return IngestionResult(
+        result = IngestionResult(
             tree=tree,
             tier_used=1,
             method="font_histogram",
             warnings=warnings,
             stats=stats,
         )
+        return _add_tables_to_result(result)
         
     except Exception as e:
         logger.warning("tier_1_failed", path=str(pdf_path), error=str(e))
@@ -364,13 +369,14 @@ def _try_tier_2(
                 nodes=tree.total_nodes,
             )
             
-            return IngestionResult(
+            result = IngestionResult(
                 tree=tree,
                 tier_used=2,
                 method="hierarchical_clustering",
                 warnings=warnings,
                 stats=stats,
             )
+            return _add_tables_to_result(result)
         except Exception as e:
             logger.warning("hierarchical_clustering_failed", error=str(e))
             warnings.append(f"Hierarchical clustering failed: {e}")
@@ -386,13 +392,14 @@ def _try_tier_2(
             nodes=tree.total_nodes,
         )
         
-        return IngestionResult(
+        result = IngestionResult(
             tree=tree,
             tier_used=2,
             method="semantic_splitter",
             warnings=warnings,
             stats=stats,
         )
+        return _add_tables_to_result(result)
         
     except Exception as e:
         logger.warning("tier_2_failed", path=str(pdf_path), error=str(e))
@@ -420,13 +427,14 @@ def _try_tier_3(
             nodes=tree.total_nodes,
         )
         
-        return IngestionResult(
+        result = IngestionResult(
             tree=tree,
             tier_used=3,
             method="ocr",
             warnings=warnings,
             stats=stats,
         )
+        return _add_tables_to_result(result)
         
     except Exception as e:
         logger.error("tier_3_failed", path=str(pdf_path), error=str(e))
@@ -538,13 +546,14 @@ def _try_xy_cut_ingestion(
             nodes=tree.total_nodes,
         )
         
-        return IngestionResult(
+        result = IngestionResult(
             tree=tree,
             tier_used=1,
             method="xy_cut_layoutlm",
             warnings=warnings,
             stats=stats,
         )
+        return _add_tables_to_result(result)
         
     except Exception as e:
         logger.warning("xy_cut_layoutlm_failed", path=str(pdf_path), error=str(e))
@@ -618,13 +627,14 @@ def _try_xy_cut_ingestion_legacy(
         
         logger.info("xy_cut_success", path=str(pdf_path), nodes=tree.total_nodes)
         
-        return IngestionResult(
+        result = IngestionResult(
             tree=tree,
             tier_used=1,
             method="xy_cut",
             warnings=warnings,
             stats=stats,
         )
+        return _add_tables_to_result(result)
         
     except Exception as e:
         logger.warning("xy_cut_failed", path=str(pdf_path), error=str(e))
@@ -961,11 +971,105 @@ def ingest_with_entities(
     return result
 
 
+# =============================================================================
+# Table Detection
+# =============================================================================
+
+
+def detect_tables_in_tree(tree: DocumentTree) -> list[DetectedTable]:
+    """
+    Detect tables in all nodes of a document tree.
+    
+    Uses TableParser to find markdown/ASCII tables in node content.
+    
+    Args:
+        tree: The ingested DocumentTree.
+        
+    Returns:
+        List of DetectedTable objects with table data.
+    """
+    from rnsr.ingestion.table_parser import TableParser
+    
+    parser = TableParser(infer_types=True, detect_headers=True)
+    detected_tables: list[DetectedTable] = []
+    
+    def process_node(node: DocumentNode) -> None:
+        """Process a single node for tables."""
+        if node.content:
+            try:
+                parsed_tables = parser.parse_from_text(
+                    text=node.content,
+                    doc_id=tree.id,
+                    page_num=node.page_num,
+                    node_id=node.id,
+                )
+                
+                for parsed in parsed_tables:
+                    # Convert ParsedTable to DetectedTable (lightweight storage format)
+                    data = []
+                    for row in parsed.rows:
+                        row_data = [cell.value for cell in row.cells]
+                        data.append(row_data)
+                    
+                    detected = DetectedTable(
+                        id=parsed.id,
+                        node_id=node.id,
+                        page_num=parsed.page_num,
+                        title=parsed.title,
+                        headers=parsed.headers,
+                        num_rows=parsed.num_rows,
+                        num_cols=parsed.num_cols,
+                        data=data,
+                    )
+                    detected_tables.append(detected)
+                    
+            except Exception as e:
+                logger.warning(
+                    "table_detection_failed",
+                    node_id=node.id,
+                    error=str(e)[:100],
+                )
+        
+        # Process children
+        for child in node.children:
+            process_node(child)
+    
+    process_node(tree.root)
+    
+    if detected_tables:
+        logger.info(
+            "tables_detected",
+            doc_id=tree.id,
+            table_count=len(detected_tables),
+        )
+    
+    return detected_tables
+
+
+def _add_tables_to_result(result: IngestionResult) -> IngestionResult:
+    """
+    Detect tables in the ingestion result and add them.
+    
+    This is called after successful ingestion to enrich the result
+    with detected table data.
+    """
+    try:
+        tables = detect_tables_in_tree(result.tree)
+        result.tables = tables
+        result.stats["tables_detected"] = len(tables)
+    except Exception as e:
+        logger.warning("table_detection_failed", error=str(e))
+        result.warnings.append(f"Table detection failed: {e}")
+    
+    return result
+
+
 # Convenience exports
 __all__ = [
     "ingest_document",
     "ingest_document_enhanced",
     "ingest_with_entities",
     "extract_entities_from_tree",
+    "detect_tables_in_tree",
     "IngestionResult",
 ]

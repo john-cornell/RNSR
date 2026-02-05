@@ -132,6 +132,9 @@ class RNSRClient:
         # Cached navigator instances for reuse across queries
         self._navigator_cache: dict[str, Any] = {}
         
+        # Tables cache (keyed by document cache_key)
+        self._tables_cache: dict[str, list] = {}
+        
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         
@@ -205,8 +208,10 @@ class RNSRClient:
         if cache_key in self._session_cache:
             skeleton, kv_store = self._session_cache[cache_key]
         elif self.cache_dir and (self.cache_dir / cache_key).exists():
-            skeleton, kv_store = load_index(self.cache_dir / cache_key)
+            skeleton, kv_store, tables = load_index(self.cache_dir / cache_key)
             self._session_cache[cache_key] = (skeleton, kv_store)
+            if tables:
+                self._tables_cache[cache_key] = tables
         else:
             # Build index
             tree = build_tree_from_text(text)
@@ -333,8 +338,10 @@ class RNSRClient:
             cache_path = self.cache_dir / cache_key
             if cache_path.exists():
                 logger.debug("using_persistent_cache", key=cache_key)
-                skeleton, kv_store = load_index(cache_path)
+                skeleton, kv_store, tables = load_index(cache_path)
                 self._session_cache[cache_key] = (skeleton, kv_store)
+                if tables:
+                    self._tables_cache[cache_key] = tables
                 return skeleton, kv_store
         
         # Create new index
@@ -345,9 +352,23 @@ class RNSRClient:
         # Store in session cache
         self._session_cache[cache_key] = (skeleton, kv_store)
         
-        # Persist if cache_dir is set
+        # Store detected tables in cache
+        if result.tables:
+            self._tables_cache[cache_key] = result.tables
+            logger.info(
+                "tables_cached",
+                cache_key=cache_key,
+                table_count=len(result.tables),
+            )
+        
+        # Persist if cache_dir is set (including tables)
         if self.cache_dir:
-            save_index(skeleton, kv_store, self.cache_dir / cache_key)
+            save_index(
+                skeleton, 
+                kv_store, 
+                self.cache_dir / cache_key,
+                tables=result.tables,
+            )
         
         return skeleton, kv_store
     
@@ -587,11 +608,15 @@ class RNSRClient:
                     enable_verification=enable_verification,
                 )
                 
+                # Get detected tables for SQL-like queries during navigation
+                tables = self._tables_cache.get(cache_key, [])
+                
                 navigator = RLMNavigator(
                     skeleton=skeleton,
                     kv_store=kv_store,
                     knowledge_graph=knowledge_graph,
                     config=config,
+                    tables=tables,
                 )
                 
                 # Use cached LLM function for performance and consistency
@@ -779,3 +804,276 @@ class RNSRClient:
         # Sort by node_id to maintain document order
         outline.sort(key=lambda x: x["id"])
         return outline
+    
+    # =========================================================================
+    # Table Query Methods
+    # =========================================================================
+    
+    def list_tables(
+        self,
+        document: str | Path,
+        force_reindex: bool = False,
+    ) -> list[dict[str, Any]]:
+        """
+        List all tables detected in a document.
+        
+        Tables are automatically detected during ingestion and can be
+        queried using SQL-like syntax.
+        
+        Args:
+            document: Path to PDF file.
+            force_reindex: Re-process even if cached.
+            
+        Returns:
+            List of table metadata dictionaries with id, title, headers, num_rows, etc.
+            
+        Example:
+            tables = client.list_tables("financial_report.pdf")
+            for t in tables:
+                print(f"{t['id']}: {t['title']} ({t['num_rows']} rows)")
+        """
+        doc_path = Path(document)
+        cache_key = self._get_cache_key(doc_path)
+        
+        # Ensure document is indexed (populates tables cache)
+        self._get_or_create_index(doc_path, force_reindex)
+        
+        tables = self._tables_cache.get(cache_key, [])
+        
+        return [
+            {
+                "id": t.id,
+                "node_id": t.node_id,
+                "page_num": t.page_num,
+                "title": t.title,
+                "headers": t.headers,
+                "num_rows": t.num_rows,
+                "num_cols": t.num_cols,
+            }
+            for t in tables
+        ]
+    
+    def query_table(
+        self,
+        document: str | Path,
+        table_id: str,
+        columns: list[str] | None = None,
+        where: dict | None = None,
+        order_by: str | None = None,
+        limit: int | None = None,
+        force_reindex: bool = False,
+    ) -> list[dict[str, Any]]:
+        """
+        Run a SQL-like query on a specific table.
+        
+        Args:
+            document: Path to PDF file.
+            table_id: The table ID to query (from list_tables()).
+            columns: List of column names to select (None = all).
+            where: Filter conditions as {column: value} or {column: {"op": ">=", "value": 100}}.
+                   Supported operators: "==", "!=", ">", ">=", "<", "<=", "contains"
+            order_by: Column name to sort by (prefix with "-" for descending).
+            limit: Maximum number of rows to return.
+            force_reindex: Re-process even if cached.
+            
+        Returns:
+            List of row dictionaries matching the query.
+            
+        Example:
+            # Get all rows from a table
+            rows = client.query_table("report.pdf", "table_001")
+            
+            # Filter and sort
+            rows = client.query_table(
+                "report.pdf",
+                "table_001",
+                columns=["Name", "Revenue"],
+                where={"Revenue": {"op": ">=", "value": 1000}},
+                order_by="-Revenue",
+                limit=10,
+            )
+        """
+        doc_path = Path(document)
+        cache_key = self._get_cache_key(doc_path)
+        
+        # Ensure document is indexed
+        self._get_or_create_index(doc_path, force_reindex)
+        
+        tables = self._tables_cache.get(cache_key, [])
+        
+        # Find the target table
+        target_table = None
+        for t in tables:
+            if t.id == table_id:
+                target_table = t
+                break
+        
+        if not target_table:
+            available = [t.id for t in tables]
+            raise ValueError(f"Table '{table_id}' not found. Available tables: {available}")
+        
+        headers = target_table.headers
+        data = target_table.data
+        
+        # Convert data rows to dicts
+        rows = []
+        for row_data in data:
+            row_dict = {}
+            for i, value in enumerate(row_data):
+                col_name = headers[i] if i < len(headers) else f"col_{i}"
+                row_dict[col_name] = value
+            rows.append(row_dict)
+        
+        # Apply WHERE filter
+        if where:
+            filtered_rows = []
+            for row in rows:
+                match = True
+                for col, condition in where.items():
+                    cell_value = row.get(col, "")
+                    
+                    if isinstance(condition, dict):
+                        op = condition.get("op", "==")
+                        cond_value = condition.get("value")
+                        
+                        try:
+                            cell_num = float(str(cell_value).replace(",", "").replace("$", "").strip())
+                            cond_num = float(cond_value)
+                            
+                            if op == "==" and cell_num != cond_num:
+                                match = False
+                            elif op == "!=" and cell_num == cond_num:
+                                match = False
+                            elif op == ">" and cell_num <= cond_num:
+                                match = False
+                            elif op == ">=" and cell_num < cond_num:
+                                match = False
+                            elif op == "<" and cell_num >= cond_num:
+                                match = False
+                            elif op == "<=" and cell_num > cond_num:
+                                match = False
+                        except (ValueError, TypeError):
+                            if op == "==" and str(cell_value) != str(cond_value):
+                                match = False
+                            elif op == "!=" and str(cell_value) == str(cond_value):
+                                match = False
+                            elif op == "contains" and str(cond_value).lower() not in str(cell_value).lower():
+                                match = False
+                    else:
+                        if str(condition).lower() not in str(cell_value).lower():
+                            match = False
+                
+                if match:
+                    filtered_rows.append(row)
+            rows = filtered_rows
+        
+        # Apply ORDER BY
+        if order_by:
+            descending = order_by.startswith("-")
+            col = order_by.lstrip("-")
+            
+            def sort_key(row):
+                val = row.get(col, "")
+                try:
+                    return float(str(val).replace(",", "").replace("$", "").strip())
+                except (ValueError, TypeError, AttributeError):
+                    return str(val).lower()
+            
+            rows = sorted(rows, key=sort_key, reverse=descending)
+        
+        # Apply LIMIT
+        if limit and limit > 0:
+            rows = rows[:limit]
+        
+        # Apply column selection
+        if columns:
+            rows = [{col: row.get(col, "") for col in columns} for row in rows]
+        
+        return rows
+    
+    def aggregate_table(
+        self,
+        document: str | Path,
+        table_id: str,
+        column: str,
+        operation: str,
+        force_reindex: bool = False,
+    ) -> float | int:
+        """
+        Run an aggregation operation on a table column.
+        
+        Args:
+            document: Path to PDF file.
+            table_id: The table ID to query.
+            column: The column name to aggregate.
+            operation: One of "sum", "avg", "count", "min", "max".
+            force_reindex: Re-process even if cached.
+            
+        Returns:
+            Numeric aggregation result.
+            
+        Example:
+            total = client.aggregate_table("report.pdf", "table_001", "Revenue", "sum")
+            avg = client.aggregate_table("report.pdf", "table_001", "Price", "avg")
+        """
+        doc_path = Path(document)
+        cache_key = self._get_cache_key(doc_path)
+        
+        # Ensure document is indexed
+        self._get_or_create_index(doc_path, force_reindex)
+        
+        tables = self._tables_cache.get(cache_key, [])
+        
+        # Find the target table
+        target_table = None
+        for t in tables:
+            if t.id == table_id:
+                target_table = t
+                break
+        
+        if not target_table:
+            available = [t.id for t in tables]
+            raise ValueError(f"Table '{table_id}' not found. Available tables: {available}")
+        
+        headers = target_table.headers
+        data = target_table.data
+        
+        # Find column index
+        col_idx = None
+        for i, h in enumerate(headers):
+            if h.lower() == column.lower():
+                col_idx = i
+                break
+        
+        if col_idx is None:
+            raise ValueError(f"Column '{column}' not found. Available columns: {headers}")
+        
+        # Extract numeric values
+        values = []
+        for row_data in data:
+            if col_idx < len(row_data):
+                val = row_data[col_idx]
+                try:
+                    clean_val = str(val).replace(",", "").replace("$", "").replace("%", "").strip()
+                    if clean_val:
+                        values.append(float(clean_val))
+                except (ValueError, TypeError, AttributeError):
+                    pass
+        
+        if not values:
+            raise ValueError(f"No numeric values found in column '{column}'.")
+        
+        operation = operation.lower()
+        
+        if operation == "sum":
+            return sum(values)
+        elif operation == "avg":
+            return sum(values) / len(values)
+        elif operation == "count":
+            return len(values)
+        elif operation == "min":
+            return min(values)
+        elif operation == "max":
+            return max(values)
+        else:
+            raise ValueError(f"Unknown operation '{operation}'. Use: sum, avg, count, min, max.")

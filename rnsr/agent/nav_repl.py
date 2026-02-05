@@ -96,6 +96,53 @@ List names of all stored findings.
 ### ready_to_synthesize() -> dict
 Signal that you have gathered enough evidence to answer.
 
+## Table Query Functions (SQL-like queries over detected tables):
+
+### list_tables() -> list
+List all tables detected in the document.
+Returns: [{"id": str, "node_id": str, "title": str, "headers": list, "num_rows": int, "num_cols": int}]
+
+### get_table_schema(table_id) -> dict
+Get column headers and sample data for a table.
+Returns: {"id": str, "title": str, "headers": list, "num_rows": int, "sample_data": list}
+
+### query_table(table_id, columns=None, where=None, order_by=None, limit=None) -> list
+Run SQL-like query on a table.
+- columns: List of column names to select (None = all)
+- where: Filter as {column: value} or {column: {"op": ">=", "value": 100}}
+  - ops: "==", "!=", ">", ">=", "<", "<=", "contains"
+- order_by: Column name to sort (prefix with "-" for descending)
+- limit: Maximum rows to return
+Returns: [{"col1": val1, "col2": val2, ...}, ...]
+
+### aggregate_table(table_id, column, operation) -> float
+Run aggregation on a column.
+- operation: "sum", "avg", "count", "min", "max"
+Returns: Numeric result
+
+## Table Query Example:
+```python
+# List detected tables
+tables = list_tables()
+for t in tables:
+    print(f"{t['id']}: {t['title']} ({t['num_rows']} rows, {t['num_cols']} cols)")
+
+# Query a specific table for high-value items
+results = query_table(
+    "table_001",
+    columns=["Description", "Amount"],
+    where={"Amount": {"op": ">=", "value": 1000}},
+    order_by="-Amount",
+    limit=5
+)
+for row in results:
+    print(f"{row['Description']}: ${row['Amount']}")
+
+# Aggregate values
+total = aggregate_table("table_001", "Amount", "sum")
+print(f"Total: ${total}")
+```
+
 ## Example Workflow:
 ```python
 # 1. Search entire document tree for relevant sections
@@ -342,6 +389,9 @@ class NavigationREPL:
     variable_store: VariableStore = field(default_factory=VariableStore)
     findings: list[dict[str, Any]] = field(default_factory=list)
     
+    # Detected tables (set via set_tables())
+    _tables: list[Any] = field(default_factory=list)
+    
     # Ready flag
     _ready_to_synthesize: bool = False
     
@@ -439,6 +489,12 @@ class NavigationREPL:
             "store_finding": self._store_finding,
             "get_findings": self._get_findings,
             "list_findings": self._list_findings,
+            
+            # Table querying
+            "list_tables": self._list_tables,
+            "query_table": self._query_table,
+            "get_table_schema": self._get_table_schema,
+            "aggregate_table": self._aggregate_table,
             
             # Synthesis trigger
             "ready_to_synthesize": self._ready_to_synthesize_fn,
@@ -1096,6 +1152,293 @@ class NavigationREPL:
         """Set LLM function for sub-queries."""
         self._llm_fn = llm_fn
     
+    def set_tables(self, tables: list) -> None:
+        """
+        Set detected tables for SQL-like querying.
+        
+        Args:
+            tables: List of DetectedTable objects from ingestion.
+        """
+        self._tables = tables or []
+        logger.info(
+            "repl_tables_set",
+            table_count=len(self._tables),
+            table_ids=[t.id for t in self._tables[:5]],
+        )
+    
+    # =========================================================================
+    # Table Query Functions
+    # =========================================================================
+    
+    def _list_tables(self) -> list[dict[str, Any]]:
+        """
+        List all tables detected in the document.
+        
+        Returns:
+            List of table metadata dictionaries with id, title, headers, num_rows, etc.
+        """
+        result = []
+        for table in self._tables:
+            result.append({
+                "id": table.id,
+                "node_id": table.node_id,
+                "page_num": table.page_num,
+                "title": table.title,
+                "headers": table.headers,
+                "num_rows": table.num_rows,
+                "num_cols": table.num_cols,
+            })
+        
+        logger.info(
+            "list_tables_called",
+            table_count=len(result),
+        )
+        return result
+    
+    def _get_table_schema(self, table_id: str) -> dict[str, Any] | str:
+        """
+        Get the schema (column headers and types) for a specific table.
+        
+        Args:
+            table_id: The table ID to get schema for.
+            
+        Returns:
+            Dictionary with headers and sample data, or error string.
+        """
+        for table in self._tables:
+            if table.id == table_id:
+                # Get sample data (first 3 rows)
+                sample_data = table.data[:3] if table.data else []
+                
+                logger.info(
+                    "get_table_schema_called",
+                    table_id=table_id,
+                    headers=table.headers,
+                    num_rows=table.num_rows,
+                )
+                
+                return {
+                    "id": table.id,
+                    "title": table.title,
+                    "headers": table.headers,
+                    "num_cols": table.num_cols,
+                    "num_rows": table.num_rows,
+                    "sample_data": sample_data,
+                }
+        
+        logger.warning("table_not_found", table_id=table_id)
+        return f"Error: Table '{table_id}' not found. Use list_tables() to see available tables."
+    
+    def _query_table(
+        self,
+        table_id: str,
+        columns: list[str] | None = None,
+        where: dict | None = None,
+        order_by: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]] | str:
+        """
+        SQL-like query over a detected table.
+        
+        Args:
+            table_id: The table ID to query.
+            columns: List of column names to select (None = all).
+            where: Filter conditions as {column: value} or {column: {"op": ">=", "value": 100}}.
+            order_by: Column name to sort by (prefix with - for descending).
+            limit: Maximum number of rows to return.
+            
+        Returns:
+            List of row dictionaries, or error string.
+            
+        Example:
+            query_table("table_001", columns=["Name", "Amount"], where={"Amount": {"op": ">=", "value": 1000}}, limit=10)
+        """
+        # Find the table
+        target_table = None
+        for table in self._tables:
+            if table.id == table_id:
+                target_table = table
+                break
+        
+        if not target_table:
+            return f"Error: Table '{table_id}' not found. Use list_tables() to see available tables."
+        
+        headers = target_table.headers
+        data = target_table.data
+        
+        # Convert data rows to dicts
+        rows = []
+        for row_data in data:
+            row_dict = {}
+            for i, value in enumerate(row_data):
+                col_name = headers[i] if i < len(headers) else f"col_{i}"
+                row_dict[col_name] = value
+            rows.append(row_dict)
+        
+        # Apply WHERE filter
+        if where:
+            filtered_rows = []
+            for row in rows:
+                match = True
+                for col, condition in where.items():
+                    cell_value = row.get(col, "")
+                    
+                    if isinstance(condition, dict):
+                        # Complex condition: {"op": ">=", "value": 100}
+                        op = condition.get("op", "==")
+                        cond_value = condition.get("value")
+                        
+                        # Try numeric comparison
+                        try:
+                            cell_num = float(cell_value.replace(",", "").replace("$", "").strip())
+                            cond_num = float(cond_value)
+                            
+                            if op == "==" and cell_num != cond_num:
+                                match = False
+                            elif op == "!=" and cell_num == cond_num:
+                                match = False
+                            elif op == ">" and cell_num <= cond_num:
+                                match = False
+                            elif op == ">=" and cell_num < cond_num:
+                                match = False
+                            elif op == "<" and cell_num >= cond_num:
+                                match = False
+                            elif op == "<=" and cell_num > cond_num:
+                                match = False
+                        except (ValueError, TypeError):
+                            # String comparison
+                            if op == "==" and str(cell_value) != str(cond_value):
+                                match = False
+                            elif op == "!=" and str(cell_value) == str(cond_value):
+                                match = False
+                            elif op == "contains" and str(cond_value).lower() not in str(cell_value).lower():
+                                match = False
+                    else:
+                        # Simple equality check (case-insensitive substring)
+                        if str(condition).lower() not in str(cell_value).lower():
+                            match = False
+                
+                if match:
+                    filtered_rows.append(row)
+            rows = filtered_rows
+        
+        # Apply ORDER BY
+        if order_by:
+            descending = order_by.startswith("-")
+            col = order_by.lstrip("-")
+            
+            def sort_key(row):
+                val = row.get(col, "")
+                # Try numeric sort
+                try:
+                    return float(val.replace(",", "").replace("$", "").strip())
+                except (ValueError, TypeError, AttributeError):
+                    return str(val).lower()
+            
+            rows = sorted(rows, key=sort_key, reverse=descending)
+        
+        # Apply LIMIT
+        if limit and limit > 0:
+            rows = rows[:limit]
+        
+        # Apply column selection
+        if columns:
+            rows = [{col: row.get(col, "") for col in columns} for row in rows]
+        
+        logger.info(
+            "query_table_executed",
+            table_id=table_id,
+            columns=columns,
+            where=where,
+            result_count=len(rows),
+        )
+        
+        return rows
+    
+    def _aggregate_table(
+        self,
+        table_id: str,
+        column: str,
+        operation: str,
+    ) -> float | int | str:
+        """
+        Run an aggregation operation on a table column.
+        
+        Args:
+            table_id: The table ID to query.
+            column: The column name to aggregate.
+            operation: One of "sum", "avg", "count", "min", "max".
+            
+        Returns:
+            Aggregation result (number), or error string.
+            
+        Example:
+            aggregate_table("table_001", "Revenue", "sum")
+        """
+        # Find the table
+        target_table = None
+        for table in self._tables:
+            if table.id == table_id:
+                target_table = table
+                break
+        
+        if not target_table:
+            return f"Error: Table '{table_id}' not found. Use list_tables() to see available tables."
+        
+        headers = target_table.headers
+        data = target_table.data
+        
+        # Find column index
+        col_idx = None
+        for i, h in enumerate(headers):
+            if h.lower() == column.lower():
+                col_idx = i
+                break
+        
+        if col_idx is None:
+            return f"Error: Column '{column}' not found. Available columns: {headers}"
+        
+        # Extract numeric values from the column
+        values = []
+        for row_data in data:
+            if col_idx < len(row_data):
+                val = row_data[col_idx]
+                try:
+                    # Clean and parse numeric value
+                    clean_val = val.replace(",", "").replace("$", "").replace("%", "").strip()
+                    if clean_val:
+                        values.append(float(clean_val))
+                except (ValueError, TypeError, AttributeError):
+                    pass  # Skip non-numeric values
+        
+        if not values:
+            return f"Error: No numeric values found in column '{column}'."
+        
+        operation = operation.lower()
+        
+        if operation == "sum":
+            result = sum(values)
+        elif operation == "avg":
+            result = sum(values) / len(values)
+        elif operation == "count":
+            result = len(values)
+        elif operation == "min":
+            result = min(values)
+        elif operation == "max":
+            result = max(values)
+        else:
+            return f"Error: Unknown operation '{operation}'. Use: sum, avg, count, min, max."
+        
+        logger.info(
+            "aggregate_table_executed",
+            table_id=table_id,
+            column=column,
+            operation=operation,
+            result=result,
+        )
+        
+        return result
+    
     def reset(self, preserve_user_vars: bool = False):
         """Reset navigation state.
         
@@ -1157,11 +1500,27 @@ def create_navigation_repl(
     skeleton: dict[str, SkeletonNode],
     kv_store: KVStore,
     query: str = "",
+    tables: list | None = None,
 ) -> NavigationREPL:
-    """Create a configured NavigationREPL."""
+    """
+    Create a configured NavigationREPL.
+    
+    Args:
+        skeleton: Document skeleton nodes.
+        kv_store: Key-value store for node content.
+        query: Initial query string.
+        tables: Optional list of DetectedTable objects for SQL-like queries.
+        
+    Returns:
+        Configured NavigationREPL instance.
+    """
     repl = NavigationREPL(
         skeleton=skeleton,
         kv_store=kv_store,
         query=query,
     )
+    
+    if tables:
+        repl.set_tables(tables)
+    
     return repl

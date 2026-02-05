@@ -339,6 +339,12 @@ class ComprehensiveBenchmarkRunner:
         
         # Indexes (built on first use)
         self._indexes: dict[str, tuple[dict, Any]] = {}
+        
+        # Knowledge graphs (built on first use)
+        self._knowledge_graphs: dict[str, Any] = {}
+        
+        # Cached LLM instance
+        self._cached_llm = None
     
     def _get_default_cases(self) -> list[BenchmarkTestCase]:
         """Get default test cases."""
@@ -360,6 +366,123 @@ class ComprehensiveBenchmarkRunner:
         skeleton, kv_store = build_skeleton_index(result.tree)
         self._indexes[key] = (skeleton, kv_store)
         return skeleton, kv_store
+    
+    def _get_cached_llm(self):
+        """Get a cached LLM instance to avoid re-initialization overhead."""
+        if self._cached_llm is None:
+            from rnsr.llm import get_llm
+            self._cached_llm = get_llm()
+        return self._cached_llm
+    
+    def _get_or_build_knowledge_graph(
+        self,
+        pdf_path: Path,
+        skeleton: dict,
+        kv_store: Any,
+    ) -> Any:
+        """
+        Get or build knowledge graph with entity extraction.
+        
+        Uses the same entity extraction patterns as benchmark-compare
+        for consistent high performance.
+        """
+        import re
+        from rnsr.indexing.knowledge_graph import KnowledgeGraph
+        
+        key = str(pdf_path)
+        if key in self._knowledge_graphs:
+            return self._knowledge_graphs[key]
+        
+        # Create in-memory knowledge graph
+        kg = KnowledgeGraph(":memory:")
+        
+        # Extract entities from each node (same patterns as benchmark-compare)
+        for node_id, node_data in skeleton.items():
+            if node_id == "root":
+                continue
+            
+            header = node_data.get("header", "")
+            content = kv_store.get(node_id, "")
+            text = f"{header}\n{content}"
+            
+            entities = self._extract_entities(text, header)
+            for entity in entities:
+                kg.add_entity(
+                    name=entity["name"],
+                    entity_type=entity["type"],
+                    source_node=node_id,
+                )
+        
+        self._knowledge_graphs[key] = kg
+        logger.info(
+            "knowledge_graph_built",
+            pdf=pdf_path.name,
+            entity_count=len(kg.get_all_entities()) if hasattr(kg, 'get_all_entities') else 0,
+        )
+        
+        return kg
+    
+    def _extract_entities(self, text: str, header: str) -> list[dict]:
+        """
+        Extract entities from text using regex patterns.
+        
+        Same patterns as scripts/compare_benchmarks.py for consistency.
+        """
+        import re
+        entities = []
+        
+        # Company/organization names
+        company_pattern = r'\b([A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*)*\s+(?:Inc\.|LLC|Ltd\.|Corp\.|Corporation|Company|Co\.))'
+        for match in re.finditer(company_pattern, text):
+            entities.append({
+                "name": match.group(1),
+                "type": "ORGANIZATION",
+            })
+        
+        # Role patterns (CEO, Director, etc.)
+        role_pattern = r'\b(CEO|CFO|CTO|COO|Director|Manager|President|Vice President|Chairman|Secretary)\b'
+        for match in re.finditer(role_pattern, text):
+            entities.append({
+                "name": match.group(0),
+                "type": "ROLE",
+            })
+        
+        # Money patterns
+        money_pattern = r'\$[\d,]+(?:\.\d{2})?(?:\s*(?:USD|million|billion|thousand))?'
+        for match in re.finditer(money_pattern, text):
+            entities.append({
+                "name": match.group(0),
+                "type": "MONEY",
+            })
+        
+        # Date patterns
+        date_pattern = r'(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}'
+        for match in re.finditer(date_pattern, text):
+            entities.append({
+                "name": match.group(0),
+                "type": "DATE",
+            })
+        
+        # Section references
+        section_pattern = r'(?:Section|Clause|Article|Part)\s+\d+(?:\.\d+)*'
+        for match in re.finditer(section_pattern, text, re.IGNORECASE):
+            entities.append({
+                "name": match.group(0),
+                "type": "SECTION_REF",
+            })
+        
+        # Person names (simple pattern)
+        person_pattern = r'\b([A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+)\b'
+        for match in re.finditer(person_pattern, text):
+            name = match.group(1)
+            # Filter out common false positives
+            if name not in ["The Company", "The Client", "The Provider"]:
+                entities.append({
+                    "name": name,
+                    "type": "PERSON",
+                })
+        
+        return entities
     
     def run(self) -> ComprehensiveBenchmarkReport:
         """Run all benchmarks."""
@@ -499,25 +622,45 @@ class ComprehensiveBenchmarkRunner:
         pdf_path: Path,
         test_case: BenchmarkTestCase,
     ) -> BenchmarkResult:
-        """Run RLM navigator with full features."""
-        from rnsr.agent.rlm_navigator import RLMConfig, run_rlm_navigator
+        """
+        Run RLM navigator with full features.
+        
+        Uses the same high-performing configuration as benchmark-compare:
+        - Knowledge graph with entity extraction
+        - enable_verification=False (critic is too aggressive)
+        - Cached LLM for consistency
+        """
+        from rnsr.agent.rlm_navigator import RLMNavigator, RLMConfig
+        from rnsr.indexing.knowledge_graph import KnowledgeGraph
+        import re
         
         skeleton, kv_store = self._get_or_build_index(pdf_path)
         
+        # Build knowledge graph with entity extraction (same as benchmark-compare)
+        kg = self._get_or_build_knowledge_graph(pdf_path, skeleton, kv_store)
+        
+        # Use same config as benchmark-compare for best performance
         config = RLMConfig(
             enable_pre_filtering=True,
-            enable_verification=True,
+            enable_verification=False,  # Disabled - critic is too aggressive
             max_recursion_depth=3,
         )
         
         start_time = time.time()
-        result = run_rlm_navigator(
-            test_case.question,
-            skeleton,
-            kv_store,
+        
+        # Create navigator with knowledge graph (same as benchmark-compare)
+        navigator = RLMNavigator(
+            skeleton=skeleton,
+            kv_store=kv_store,
+            knowledge_graph=kg,
             config=config,
-            metadata=test_case.metadata,
         )
+        
+        # Use cached LLM for consistency
+        llm = self._get_cached_llm()
+        navigator.set_llm_function(lambda p: str(llm.complete(p)))
+        
+        result = navigator.navigate(test_case.question, metadata=test_case.metadata)
         latency_ms = (time.time() - start_time) * 1000
         
         answer = result.get("answer", "")

@@ -31,12 +31,12 @@ import structlog
 
 from rnsr.exceptions import IndexingError
 from rnsr.indexing.kv_store import InMemoryKVStore, KVStore, SQLiteKVStore
-from rnsr.models import SkeletonNode
+from rnsr.models import DetectedTable, SkeletonNode
 
 logger = structlog.get_logger(__name__)
 
 # Version for format compatibility
-INDEX_FORMAT_VERSION = "1.0"
+INDEX_FORMAT_VERSION = "1.1"  # Updated for tables support
 
 
 def save_index(
@@ -44,28 +44,31 @@ def save_index(
     kv_store: KVStore,
     index_dir: str | Path,
     metadata: dict[str, Any] | None = None,
+    tables: list[DetectedTable] | None = None,
 ) -> Path:
     """
-    Save a skeleton index and KV store to disk.
+    Save a skeleton index, KV store, and detected tables to disk.
     
     Creates a directory structure:
         index_dir/
             manifest.json      # Version, metadata, timestamps
             skeleton.json      # SkeletonNode structures
             content.db         # SQLite KV store (copied or created)
+            tables.json        # Detected tables (if any)
     
     Args:
         skeleton: Dictionary of node_id -> SkeletonNode
         kv_store: KV store containing full text
         index_dir: Directory to save the index
         metadata: Optional metadata (title, source, etc.)
+        tables: Optional list of DetectedTable objects from ingestion
     
     Returns:
         Path to the index directory
         
     Example:
         skeleton, kv = build_skeleton_index(tree)
-        save_index(skeleton, kv, "./indexes/contract_2024/")
+        save_index(skeleton, kv, "./indexes/contract_2024/", tables=result.tables)
     """
     index_path = Path(index_dir)
     index_path.mkdir(parents=True, exist_ok=True)
@@ -75,6 +78,7 @@ def save_index(
         "version": INDEX_FORMAT_VERSION,
         "created_at": datetime.now().isoformat(),
         "node_count": len(skeleton),
+        "table_count": len(tables) if tables else 0,
         "metadata": metadata or {},
     }
     
@@ -98,6 +102,13 @@ def save_index(
     with open(skeleton_path, "w") as f:
         json.dump(skeleton_data, f, indent=2)
     
+    # Save detected tables
+    if tables:
+        tables_path = index_path / "tables.json"
+        tables_data = [_detected_table_to_dict(t) for t in tables]
+        with open(tables_path, "w") as f:
+            json.dump(tables_data, f, indent=2)
+    
     # Handle KV store
     content_path = index_path / "content.db"
     
@@ -119,6 +130,7 @@ def save_index(
         "index_saved",
         path=str(index_path),
         nodes=len(skeleton),
+        tables=len(tables) if tables else 0,
     )
     
     return index_path
@@ -127,19 +139,19 @@ def save_index(
 def load_index(
     index_dir: str | Path,
     in_memory: bool = False,
-) -> tuple[dict[str, SkeletonNode], KVStore]:
+) -> tuple[dict[str, SkeletonNode], KVStore, list[DetectedTable]]:
     """
-    Load a skeleton index and KV store from disk.
+    Load a skeleton index, KV store, and detected tables from disk.
     
     Args:
         index_dir: Directory containing the saved index
         in_memory: If True, load KV store into memory (faster but uses more RAM)
     
     Returns:
-        Tuple of (skeleton dict, kv_store)
+        Tuple of (skeleton dict, kv_store, tables list)
         
     Example:
-        skeleton, kv = load_index("./indexes/contract_2024/")
+        skeleton, kv, tables = load_index("./indexes/contract_2024/")
         answer = run_navigator("What are the payment terms?", skeleton, kv)
     """
     index_path = Path(index_dir)
@@ -156,7 +168,8 @@ def load_index(
         manifest = json.load(f)
     
     version = manifest.get("version", "unknown")
-    if version != INDEX_FORMAT_VERSION:
+    # Accept both 1.0 and 1.1 versions (1.0 just won't have tables)
+    if version not in (INDEX_FORMAT_VERSION, "1.0"):
         logger.warning(
             "index_version_mismatch",
             expected=INDEX_FORMAT_VERSION,
@@ -175,6 +188,14 @@ def load_index(
         node_id: _dict_to_skeleton_node(data)
         for node_id, data in skeleton_data.items()
     }
+    
+    # Load detected tables (optional - may not exist for older indexes)
+    tables: list[DetectedTable] = []
+    tables_path = index_path / "tables.json"
+    if tables_path.exists():
+        with open(tables_path) as f:
+            tables_data = json.load(f)
+        tables = [_dict_to_detected_table(t) for t in tables_data]
     
     # Load KV store
     content_path = index_path / "content.db"
@@ -197,10 +218,11 @@ def load_index(
         "index_loaded",
         path=str(index_path),
         nodes=len(skeleton),
+        tables=len(tables),
         version=version,
     )
     
-    return skeleton, kv_store
+    return skeleton, kv_store, tables
 
 
 def get_index_info(index_dir: str | Path) -> dict[str, Any]:
@@ -320,4 +342,32 @@ def _dict_to_skeleton_node(data: dict[str, Any]) -> SkeletonNode:
         child_ids=data.get("child_ids", []),
         page_num=data.get("page_num"),
         metadata=data.get("metadata", {}),
+    )
+
+
+def _detected_table_to_dict(table: DetectedTable) -> dict[str, Any]:
+    """Convert DetectedTable to JSON-serializable dict."""
+    return {
+        "id": table.id,
+        "node_id": table.node_id,
+        "page_num": table.page_num,
+        "title": table.title,
+        "headers": table.headers,
+        "num_rows": table.num_rows,
+        "num_cols": table.num_cols,
+        "data": table.data,
+    }
+
+
+def _dict_to_detected_table(data: dict[str, Any]) -> DetectedTable:
+    """Convert dict back to DetectedTable."""
+    return DetectedTable(
+        id=data["id"],
+        node_id=data["node_id"],
+        page_num=data.get("page_num"),
+        title=data.get("title", ""),
+        headers=data.get("headers", []),
+        num_rows=data.get("num_rows", 0),
+        num_cols=data.get("num_cols", 0),
+        data=data.get("data", []),
     )
