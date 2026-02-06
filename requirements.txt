@@ -29,6 +29,9 @@ google-genai>=1.0.0            # New official SDK (replaces deprecated google-ge
 llama-index-llms-gemini>=0.1.0
 llama-index-embeddings-gemini>=0.1.0
 
+# UI
+gradio>=4.0.0              # Interactive demo interface
+
 # Utilities
 python-dotenv>=1.0.0
 pydantic>=2.0.0
