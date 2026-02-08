@@ -46,8 +46,34 @@ Unlike traditional RAG systems that chunk documents and lose context, RNSR:
 # FinanceBench (achieves 100%)
 make benchmark-compare
 
-# Full benchmark suite
-make benchmark
+# Full benchmark suite (all datasets)
+python run_all_benchmarks.py
+
+# Specific benchmarks
+python run_all_benchmarks.py --benchmarks financebench multihiertt tatqa
+
+# Quick smoke test (5 samples per benchmark)
+python run_all_benchmarks.py --max-samples 5
+```
+
+### Additional Benchmark Datasets
+
+Beyond FinanceBench, RNSR ships with loaders for four additional academic benchmarks:
+
+| Benchmark | Domain | Task | Key Metric |
+|-----------|--------|------|------------|
+| **[MultiHiertt](https://github.com/psunlpgroup/MultiHiertt)** | Finance | Multi-step arithmetic over hierarchical tables | Exact Match, F1 |
+| **[TAT-QA](https://nextplusplus.github.io/TAT-QA/)** | Finance | Joint table + text reasoning | EM, F1 (by answer type) |
+| **[QASPER](https://allenai.org/data/qasper)** | Scientific papers | Long-document QA across sections | F1 |
+| **[DocVQA](https://www.docvqa.org/)** | Visual documents | QA over document images | ANLS |
+
+```python
+from rnsr.benchmarks import MultiHierttLoader, TATQALoader, QASPERLoader, DocVQALoader
+
+# Load any benchmark dataset
+samples = MultiHierttLoader(max_samples=50).load()
+for s in samples:
+    print(f"Q: {s.question}  A: {s.expected_answer}")
 ```
 
 ### FinanceBench: The Gold Standard
@@ -89,6 +115,26 @@ RNSR combines neural and symbolic approaches to achieve accurate document unders
 | **Vision Mode** | OCR-free analysis for scanned documents and charts |
 
 ## Installation
+
+### From PyPI (recommended)
+
+```bash
+# Lightweight install (no torch — fast, small)
+pip install rnsr
+
+# With vision features (LayoutLM, torch, torchvision)
+pip install "rnsr[vision]"
+
+# With a specific LLM provider
+pip install "rnsr[openai]"       # OpenAI
+pip install "rnsr[anthropic]"    # Anthropic
+pip install "rnsr[gemini]"       # Google Gemini
+
+# Everything
+pip install "rnsr[all]"
+```
+
+### From Source (for development)
 
 ```bash
 # Clone the repository
@@ -740,6 +786,7 @@ mypy rnsr/
 
 - Python 3.10+
 - At least one LLM API key (OpenAI, Anthropic, or Gemini)
+- **Note:** `pip install rnsr` is lightweight (~20 MB). Vision features (LayoutLM, torch) are optional via `pip install "rnsr[vision]"`.
 
 ## License
 

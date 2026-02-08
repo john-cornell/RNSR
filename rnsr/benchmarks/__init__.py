@@ -74,6 +74,12 @@ from rnsr.benchmarks.comprehensive_benchmark import (
     get_multi_hop_cases,
 )
 
+# New benchmark loaders (Phase 1 - generalization proof)
+from rnsr.benchmarks.multihiertt_bench import MultiHierttLoader
+from rnsr.benchmarks.tatqa_bench import TATQALoader
+from rnsr.benchmarks.qasper_bench import QASPERLoader
+from rnsr.benchmarks.docvqa_bench import DocVQALoader, _compute_anls
+
 __all__ = [
     # Performance
     "PerformanceBenchmark",
@@ -115,4 +121,10 @@ __all__ = [
     "get_financebench_cases",
     "get_oolong_style_cases",
     "get_multi_hop_cases",
+    # New benchmark loaders
+    "MultiHierttLoader",
+    "TATQALoader",
+    "QASPERLoader",
+    "DocVQALoader",
+    "_compute_anls",
 ]

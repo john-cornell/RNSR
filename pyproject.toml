@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rnsr"
-version = "0.1.0"
+version = "0.2.0"
 description = "Recursive Neural-Symbolic Retriever - Hierarchical document retrieval with font-based structure analysis"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.10"
 authors = [
     {name = "RNSR Contributors"}
@@ -25,7 +25,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -47,17 +46,17 @@ dependencies = [
     "llama-index>=0.10.0",
     "langgraph>=0.2.0",
     "langchain-core>=0.2.0",
-    # Visual analysis dependencies (LayoutLMv3)
-    "transformers>=4.35.0",  # HuggingFace transformers for LayoutLM
-    "torch>=2.0.0",  # PyTorch for model inference
-    "torchvision>=0.15.0",  # Vision utilities
     "pillow>=10.0.0",  # Image processing
-    "pdf2image>=1.16.0",  # PDF to image conversion
     "scikit-learn>=1.3.0",  # k-means clustering for headers
-    "pymupdf>=1.23.0",  # PyMuPDF for font analysis
 ]
 
 [project.optional-dependencies]
+vision = [
+    "transformers>=4.35.0",  # HuggingFace transformers for LayoutLM
+    "torch>=2.0.0",  # PyTorch for model inference
+    "torchvision>=0.15.0",  # Vision utilities
+    "pdf2image>=1.16.0",  # PDF to image conversion
+]
 openai = [
     "openai>=1.0.0",
     "llama-index-llms-openai>=0.1.0",
@@ -71,7 +70,7 @@ gemini = [
     "google-genai>=1.0.0",
 ]
 all = [
-    "rnsr[openai,anthropic,gemini]",
+    "rnsr[vision,openai,anthropic,gemini]",
 ]
 benchmarks = [
     "datasets>=2.0.0",
@@ -92,10 +91,10 @@ dev = [
 rnsr = "rnsr.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/rnsr-project/rnsr"
-Documentation = "https://github.com/rnsr-project/rnsr#readme"
-Repository = "https://github.com/rnsr-project/rnsr.git"
-Issues = "https://github.com/rnsr-project/rnsr/issues"
+Homepage = "https://github.com/theeufj/RNSR"
+Documentation = "https://github.com/theeufj/RNSR#readme"
+Repository = "https://github.com/theeufj/RNSR.git"
+Issues = "https://github.com/theeufj/RNSR/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
