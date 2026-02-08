@@ -55,11 +55,8 @@ from rnsr.extraction.rlm_unified_extractor import (
     extract_entities_and_relationships,
 )
 
-# Legacy/alternative extractors
-from rnsr.extraction.entity_extractor import (
-    EntityExtractor,  # DEPRECATED
-    merge_entities,
-)
+# Legacy utility functions (classes removed — use RLMUnifiedExtractor instead)
+from rnsr.extraction.entity_extractor import merge_entities
 from rnsr.extraction.grounded_extractor import (
     GroundedEntityExtractor,
     ValidationMode,
@@ -93,10 +90,7 @@ from rnsr.extraction.relationship_patterns import (
     RelationshipCandidate,
     extract_relationship_candidates,
 )
-from rnsr.extraction.relationship_extractor import (
-    RelationshipExtractor,  # DEPRECATED
-    extract_implicit_relationships,
-)
+from rnsr.extraction.relationship_extractor import extract_implicit_relationships
 from rnsr.extraction.entity_linker import (
     EntityLinker,
     LearnedNormalizationPatterns,
@@ -133,10 +127,6 @@ __all__ = [
     "RLMExtractionResult",
     "GroundedEntityExtractor",
     "ValidationMode",
-    
-    # Legacy extractors (DEPRECATED - emit warnings)
-    "EntityExtractor",
-    "RelationshipExtractor",
     
     # Supporting components
     "CandidateExtractor",

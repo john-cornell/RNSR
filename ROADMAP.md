@@ -54,7 +54,7 @@ The single most important thing before a Show HN post. "Does it generalize?" is 
 
 ### 2.3 Remove Deprecated Extractors from Public API
 - **What:** `EntityExtractor` and `RelationshipExtractor` are deprecated but still exported
-- **Status:** [ ] Not started
+- **Status:** [x] ✅ Completed — removed from `rnsr/extraction/__init__.py` exports; utility functions (`merge_entities`, `extract_implicit_relationships`) kept
 
 ---
 
