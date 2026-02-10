@@ -30,7 +30,7 @@ llama-index-llms-gemini>=0.1.0
 llama-index-embeddings-gemini>=0.1.0
 
 # UI
-gradio>=4.0.0              # Interactive demo interface
+gradio>=6.0.0              # Interactive demo interface (Gradio 6.x required)
 
 # Utilities
 python-dotenv>=1.0.0

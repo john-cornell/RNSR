@@ -80,7 +80,12 @@ class DocVQALoader:
         download_images: bool = False,
     ) -> BenchmarkDataset:
         """
-        Load the DocVQA dataset from HuggingFace.
+        Load the DocVQA dataset from HuggingFace using parquet files.
+
+        Downloads parquet shards directly via hf_hub_download to avoid
+        compatibility issues with the datasets library. Images are
+        extracted from the parquet data and stored as bytes in metadata
+        so they can be passed to VisionLLM during ToT navigation.
 
         Args:
             split: Dataset split ('train', 'validation', 'test')
@@ -91,54 +96,87 @@ class DocVQALoader:
             BenchmarkDataset containing DocVQA questions
         """
         try:
-            from datasets import load_dataset  # type: ignore
-            dataset = load_dataset("lmms-lab/DocVQA", split=split)
-        except Exception:
-            try:
-                from datasets import load_dataset  # type: ignore
-                dataset = load_dataset("nielsr/docvqa", split=split)
-            except Exception as e:
-                logger.error("Failed to load DocVQA dataset", error=str(e))
-                return DocVQALoader._load_from_local(split, max_samples)
+            import io
+            import pandas as pd  # type: ignore
+            from huggingface_hub import hf_hub_download  # type: ignore
+
+            # The parquet files use the full split name as-is
+            parquet_split = split
+
+            # Download first parquet shard
+            parquet_path = hf_hub_download(
+                repo_id="lmms-lab/DocVQA",
+                filename=f"DocVQA/{parquet_split}-00000-of-00006.parquet",
+                repo_type="dataset",
+            )
+            df = pd.read_parquet(parquet_path)
+        except Exception as e:
+            logger.error("Failed to load DocVQA dataset", error=str(e))
+            return DocVQALoader._load_from_local(split, max_samples)
 
         questions: list[BenchmarkQuestion] = []
         count = 0
 
-        for item in dataset:
-            if not isinstance(item, dict):
-                continue
+        for _, row in df.iterrows():
             if max_samples and count >= max_samples:
                 break
 
-            question_text = item.get("question", "")
+            question_text = row.get("question", "")
             if not question_text:
                 continue
 
             # DocVQA answers can be a list of acceptable answers
-            answers = item.get("answers", item.get("answer", []))
-            if isinstance(answers, list):
-                answer_str = answers[0] if answers else ""
-                all_answers = answers
+            raw_answers = row.get("answers", row.get("answer", []))
+            # Handle numpy arrays from parquet
+            if hasattr(raw_answers, "tolist"):
+                raw_answers = raw_answers.tolist()
+            if isinstance(raw_answers, list):
+                all_answers = [str(a) for a in raw_answers]
+                answer_str = all_answers[0] if all_answers else ""
             else:
-                answer_str = str(answers)
+                answer_str = str(raw_answers)
                 all_answers = [answer_str]
 
-            # Image handling
-            image = item.get("image", None)
+            # Extract image bytes from parquet (PIL Image stored as dict)
+            image_bytes = None
+            image_data = row.get("image", None)
+            if image_data is not None:
+                try:
+                    from PIL import Image  # type: ignore
+
+                    if isinstance(image_data, Image.Image):
+                        buf = io.BytesIO()
+                        image_data.save(buf, format="PNG")
+                        image_bytes = buf.getvalue()
+                    elif isinstance(image_data, dict) and "bytes" in image_data:
+                        image_bytes = image_data["bytes"]
+                    elif isinstance(image_data, bytes):
+                        image_bytes = image_data
+                except Exception as img_err:
+                    logger.debug("Could not extract image bytes", error=str(img_err))
+
+            # Save image to disk if requested
             image_path = None
-            if download_images and image is not None:
-                image_path = DocVQALoader._save_image(image, f"docvqa_{count}")
+            if download_images and image_bytes is not None:
+                try:
+                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    image_path = CACHE_DIR / f"docvqa_{count}.png"
+                    with open(image_path, "wb") as img_f:
+                        img_f.write(image_bytes)
+                except Exception:
+                    image_path = None
 
-            # Build context: for DocVQA we may extract text via OCR or
-            # provide the image path for vision-based processing
+            # Build context: OCR text if available
             contexts: list[str] = []
-
-            # Some DocVQA variants include OCR text
-            ocr_text = item.get("ocr_text", "") or item.get("words", "")
+            ocr_text = row.get("ocr_text", "") or row.get("words", "")
             if isinstance(ocr_text, list):
                 ocr_text = " ".join(str(w) for w in ocr_text)
             if ocr_text:
                 contexts.append(f"[OCR TEXT]\n{ocr_text}")
+
+            # If no OCR text and we have an image, add placeholder context
+            if not contexts and image_bytes is not None:
+                contexts.append("[DOCUMENT IMAGE]\nThis document requires visual analysis.")
 
             q = BenchmarkQuestion(
                 id=f"docvqa_{count}",
@@ -151,7 +189,8 @@ class DocVQALoader:
                     "dataset": "docvqa",
                     "all_answers": all_answers,
                     "image_path": str(image_path) if image_path else None,
-                    "has_image": image is not None,
+                    "has_image": image_bytes is not None,
+                    "image_bytes": image_bytes,  # Raw bytes for VisionLLM
                     "split": split,
                 },
             )

@@ -285,7 +285,7 @@ def evaluate_retrieval(
             question=tc.question,
             skeleton=skeleton,
             kv_store=kv_store,
-            max_iterations=20,
+            max_iterations=50,
         )
         
         # Extract retrieved nodes

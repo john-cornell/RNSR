@@ -19,6 +19,7 @@ These benchmarks help demonstrate RNSR's advantages:
 from __future__ import annotations
 
 import json
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -773,6 +774,202 @@ class RAGASEvaluator:
             context_relevancy=sum(m.context_relevancy for m in all_metrics) / len(all_metrics),
             answer_correctness=sum(m.answer_correctness for m in all_metrics) / len(all_metrics),
         )
+
+
+# =============================================================================
+# LLM-as-Judge Evaluator (semantic correctness vs ground truth)
+# =============================================================================
+
+JUDGE_PROMPT = """You are evaluating whether a predicted answer is correct given a question and ground truth.
+
+Question: {question}
+Ground Truth Answer: {ground_truth}
+Predicted Answer: {prediction}
+
+Does the predicted answer convey the same information as the ground truth? The predicted answer may be verbose, include source citations, or use different wording - focus on semantic equivalence. Ignore formatting and minor phrasing differences.
+
+**Numeric and derived answers:** Treat numeric answers as correct when the **value** matches the ground truth even if units or format differ (e.g. 8325 thousand = 8.325 million = 8325000; "8325 thousand" vs "$8.325 million"). When the question asks for a derived value (average, total, sum, ratio), treat the prediction as correct if it states or clearly implies the same number, even if the wording differs.
+
+Respond with ONLY valid JSON (no markdown, no extra text):
+{{"verdict": "correct"|"partial"|"incorrect", "score": 1.0|0.5|0.0, "explanation": "brief reason"}}
+
+Use: verdict "correct" and score 1.0 when the predicted answer clearly contains the same factual answer (including numerically equivalent values). Use "partial" and 0.5 when it is partly right. Use "incorrect" and 0.0 when it is wrong or does not address the question."""
+
+
+def _normalize_numeric_for_judge(text: str) -> float | None:
+    """
+    Extract a single numeric value from a string for judge pre-check.
+    Handles formats like "8325 thousand", "8.325 million", "16650", "$1.9 million".
+    Returns None if no single clear number is found.
+    """
+    if not text or not text.strip():
+        return None
+    text = text.strip().lower()
+    # Remove $ and normalize spaces; keep commas for digit grouping
+    text_clean = text.replace("$", " ").replace(",", "")
+    # Match number (optional decimals) with optional scale word immediately after
+    pattern = r"(\d+(?:\.\d+)?)\s*(thousand|million|billion|k|m|b)?"
+    matches = list(re.finditer(pattern, text_clean))
+    if not matches:
+        return None
+    # Use the last match (often the final answer in a sentence)
+    m = matches[-1]
+    num_str = m.group(1)
+    scale = m.group(2)
+    try:
+        val = float(num_str)
+    except ValueError:
+        return None
+    if scale:
+        if scale in ("thousand", "k"):
+            val *= 1e3
+        elif scale in ("million", "m"):
+            val *= 1e6
+        elif scale in ("billion", "b"):
+            val *= 1e9
+    return val
+
+
+@dataclass
+class LLMJudgeResult:
+    """Result from LLM-as-judge evaluation."""
+
+    verdict: Literal["correct", "partial", "incorrect"]
+    score: float
+    explanation: str
+    raw_response: str = ""
+
+    @property
+    def is_correct(self) -> bool:
+        return self.verdict == "correct"
+
+    @property
+    def is_partial(self) -> bool:
+        return self.verdict == "partial"
+
+
+class LLMJudgeEvaluator:
+    """
+    Evaluate predicted answers against ground truth using an LLM judge.
+
+    Semantically compares RNSR's verbose, sourced answers to benchmark
+    ground truth so that correct content is not penalized for formatting.
+    """
+
+    def __init__(
+        self,
+        llm_provider: str | None = None,
+        llm_model: str | None = None,
+    ):
+        self.llm_provider = llm_provider
+        self.llm_model = llm_model
+        self._llm: Any = None
+
+    def _get_llm(self) -> Any:
+        if self._llm is None:
+            from rnsr.llm import LLMProvider, get_llm
+
+            kwargs: dict[str, Any] = {}
+            if self.llm_provider is not None:
+                provider = (
+                    LLMProvider(self.llm_provider)
+                    if isinstance(self.llm_provider, str)
+                    else self.llm_provider
+                )
+                kwargs["provider"] = provider
+            if self.llm_model is not None:
+                kwargs["model"] = self.llm_model
+            self._llm = get_llm(**kwargs)
+        return self._llm
+
+    def evaluate(
+        self,
+        question: str,
+        predicted_answer: str,
+        ground_truth: str,
+        all_acceptable_answers: list[str] | None = None,
+    ) -> LLMJudgeResult:
+        """
+        Judge whether the predicted answer is correct vs ground truth.
+
+        Args:
+            question: The question that was asked.
+            predicted_answer: RNSR's (or model's) answer.
+            ground_truth: Reference correct answer.
+            all_acceptable_answers: Optional list of alternative correct answers.
+
+        Returns:
+            LLMJudgeResult with verdict, score (1.0/0.5/0.0), and explanation.
+        """
+        # Numeric pre-check: if both GT and prediction have the same numeric value, treat as correct
+        gt_num = _normalize_numeric_for_judge(ground_truth)
+        pred_num = _normalize_numeric_for_judge(predicted_answer)
+        if gt_num is not None and pred_num is not None:
+            if gt_num == 0 and pred_num == 0:
+                return LLMJudgeResult(
+                    verdict="correct",
+                    score=1.0,
+                    explanation="Both ground truth and prediction are zero (numeric pre-check).",
+                    raw_response="",
+                )
+            if gt_num != 0:
+                rel = abs(gt_num - pred_num) / abs(gt_num)
+                if rel <= 0.02:
+                    return LLMJudgeResult(
+                        verdict="correct",
+                        score=1.0,
+                        explanation="Numeric value matches ground truth (numeric pre-check).",
+                        raw_response="",
+                    )
+
+        gt_display = ground_truth
+        if all_acceptable_answers:
+            gt_display = " | ".join(all_acceptable_answers[:5])
+            if len(all_acceptable_answers) > 5:
+                gt_display += " (or others)"
+
+        prompt = JUDGE_PROMPT.format(
+            question=question,
+            ground_truth=gt_display,
+            prediction=predicted_answer[:4000],
+        )
+
+        try:
+            llm = self._get_llm()
+            response = llm.complete(prompt)
+            raw = str(response).strip()
+            # Strip markdown code block if present
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+            data = json.loads(raw)
+            verdict = data.get("verdict", "incorrect").lower()
+            if verdict not in ("correct", "partial", "incorrect"):
+                verdict = "incorrect"
+            score = float(data.get("score", 0.0))
+            if verdict == "correct":
+                score = max(score, 1.0)
+            elif verdict == "partial":
+                score = max(0.0, min(1.0, score))
+            else:
+                score = 0.0
+            explanation = str(data.get("explanation", ""))
+            return LLMJudgeResult(
+                verdict=verdict,
+                score=score,
+                explanation=explanation,
+                raw_response=raw,
+            )
+        except Exception as e:
+            logger.warning("llm_judge_failed", error=str(e))
+            return LLMJudgeResult(
+                verdict="incorrect",
+                score=0.0,
+                explanation=f"Judge failed: {e}",
+                raw_response="",
+            )
 
 
 # =============================================================================

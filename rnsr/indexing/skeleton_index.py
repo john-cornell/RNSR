@@ -37,20 +37,35 @@ from rnsr.models import DocumentNode, DocumentTree, SkeletonNode
 logger = structlog.get_logger(__name__)
 
 
-def generate_summary(content: str, max_words: int = 100) -> str:
+def generate_summary(
+    content: str,
+    max_words: int = 100,
+    child_headers: list[str] | None = None,
+) -> str:
     """
     Generate a summary for a node's content.
     
-    EXTRACTIVE approach: Take first portion to preserve key facts,
-    entities, and concrete details that ToT needs for evaluation.
+    For **parent / group nodes** with children, produces a table-of-contents
+    style summary listing child section headers.  This gives ToT far better
+    signal than the first 100 words of (possibly empty) group content.
+    
+    For **leaf nodes**, uses an extractive approach (first *max_words* words)
+    to preserve key facts, entities, and concrete details.
     
     Args:
         content: Full text content.
         max_words: Maximum words in summary.
+        child_headers: Optional list of child-node headers.  When provided
+            (and non-empty), the summary becomes a table-of-contents.
         
     Returns:
-        Summary text (50-100 words).
+        Summary text.
     """
+    # Table-of-contents summary for parent nodes
+    if child_headers:
+        toc = ", ".join(h for h in child_headers if h)
+        return f"Contains: {toc}"
+
     if not content:
         return ""
     
@@ -250,9 +265,20 @@ class SkeletonIndexBuilder:
         if full_content:
             self.kv_store.put(node.id, full_content)
         
-        # Generate summary (summary-only in skeleton!)
-        summary = generate_summary(full_content)
+        # Generate summary.
+        # For parent nodes with children, produce a table-of-contents
+        # listing the child headers so ToT can make informed decisions.
+        child_headers = [c.header for c in node.children] if node.children else None
+        summary = generate_summary(full_content, child_headers=child_headers)
         
+        # Propagate node-level metadata (e.g. is_table) into the skeleton
+        skel_metadata: dict[str, Any] = {
+            "has_children": len(node.children) > 0,
+            "content_chars": len(full_content),
+        }
+        if hasattr(node, "metadata") and node.metadata:
+            skel_metadata.update(node.metadata)
+
         # Create skeleton node
         skeleton = SkeletonNode(
             node_id=node.id,
@@ -262,10 +288,7 @@ class SkeletonIndexBuilder:
             summary=summary,  # ONLY summary in index
             child_ids=[c.id for c in node.children],
             page_num=node.page_num,
-            metadata={
-                "has_children": len(node.children) > 0,
-                "content_chars": len(full_content),
-            },
+            metadata=skel_metadata,
         )
         
         self.nodes[node.id] = skeleton

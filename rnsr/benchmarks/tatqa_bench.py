@@ -54,40 +54,41 @@ class TATQALoader:
             BenchmarkDataset containing TAT-QA questions
         """
         try:
-            from datasets import load_dataset  # type: ignore
-            dataset = load_dataset("next-tat-qa/TAT-QA", split=split)
-        except Exception:
-            # Try alternative dataset names
-            try:
-                from datasets import load_dataset  # type: ignore
-                dataset = load_dataset("ibm/finqa", split=split)  # Similar benchmark
-            except Exception as e:
-                logger.error("Failed to load TAT-QA dataset", error=str(e))
-                return TATQALoader._load_from_local(split, max_samples)
+            from huggingface_hub import hf_hub_download  # type: ignore
+
+            json_path = hf_hub_download(
+                repo_id="next-tat/TAT-QA",
+                filename=f"tatqa_dataset_{split}.json",
+                repo_type="dataset",
+            )
+            with open(json_path) as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.error("Failed to load TAT-QA dataset", error=str(e))
+            return TATQALoader._load_from_local(split, max_samples)
 
         questions: list[BenchmarkQuestion] = []
         count = 0
 
-        for item in dataset:
-            if not isinstance(item, dict):
+        for doc in data:
+            if not isinstance(doc, dict):
                 continue
             if max_samples and count >= max_samples:
                 break
 
-            # TAT-QA structure: table (structured), paragraphs (text), questions
-            table = item.get("table", {})
-            paragraphs = item.get("paragraphs", [])
-            qa_list = item.get("questions", [item])  # Some formats nest questions
+            # TAT-QA raw JSON: each doc has table, paragraphs, questions
+            table = doc.get("table", {})
+            paragraphs = doc.get("paragraphs", [])
 
-            for qa in (qa_list if isinstance(qa_list, list) else [qa_list]):
+            for qa in doc.get("questions", []):
                 if max_samples and count >= max_samples:
                     break
 
-                question_text = qa.get("question", item.get("question", ""))
-                answer = qa.get("answer", item.get("answer", ""))
-                answer_type = qa.get("answer_type", item.get("answer_type", "span"))
-                scale = qa.get("scale", item.get("scale", ""))
-                derivation = qa.get("derivation", item.get("derivation", ""))
+                question_text = qa.get("question", "")
+                answer = qa.get("answer", "")
+                answer_type = qa.get("answer_type", "span")
+                scale = qa.get("scale", "")
+                derivation = qa.get("derivation", "")
 
                 if not question_text:
                     continue

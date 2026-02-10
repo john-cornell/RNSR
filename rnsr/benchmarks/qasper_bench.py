@@ -55,7 +55,7 @@ class QASPERLoader:
         """
         try:
             from datasets import load_dataset  # type: ignore
-            dataset = load_dataset("allenai/qasper", split=split)
+            dataset = load_dataset("allenai/qasper", split=split, trust_remote_code=True)
         except Exception as e:
             logger.error("Failed to load QASPER dataset", error=str(e))
             return QASPERLoader._load_from_local(split, max_samples)

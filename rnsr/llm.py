@@ -422,6 +422,37 @@ class ResilientLLMWrapper:
         """Complete a prompt with fallback support."""
         return self._call_with_fallback("complete", prompt, **kwargs)
     
+    def complete_with_image(self, prompt: str, image_bytes: bytes, **kwargs: Any) -> Any:
+        """Complete a prompt with an image (multimodal) with fallback support.
+
+        Falls back to text-only ``complete()`` if no provider supports
+        multimodal input.
+        """
+        last_error = None
+        for provider, llm in self._get_available_llms():
+            if not hasattr(llm, "complete_with_image"):
+                continue
+            try:
+                result = llm.complete_with_image(prompt, image_bytes, **kwargs)
+                if provider != self._current_provider:
+                    logger.info(
+                        "switched_to_fallback_provider",
+                        from_provider=self._current_provider.value,
+                        to_provider=provider.value,
+                    )
+                    self._current_provider = provider
+                return result
+            except Exception as e:
+                last_error = e
+                if is_rate_limit_error(e):
+                    self._mark_rate_limited(provider)
+                    continue
+                raise
+
+        # No multimodal-capable provider succeeded — fall back to text-only
+        logger.warning("multimodal_unavailable_falling_back_to_text")
+        return self.complete(prompt, **kwargs)
+    
     def chat(self, messages: Any, **kwargs: Any) -> Any:
         """Chat with fallback support."""
         return self._call_with_fallback("chat", messages, **kwargs)
@@ -552,6 +583,38 @@ def _get_gemini_llm(model: str, **kwargs: Any) -> Any:
                 wait=wait_exponential(multiplier=1, min=2, max=30),
                 retry=retry_if_exception_type(RETRY_EXCEPTIONS),
             )
+            def complete_with_image(self, prompt: str, image_bytes: bytes, **kw: Any) -> str:
+                """Complete a prompt with an image (multimodal)."""
+                image_part = types.Part.from_bytes(
+                    data=image_bytes, mime_type="image/png",
+                )
+                contents = [image_part, prompt]
+                try:
+                    response = self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=contents,
+                        config=self.generation_config,
+                    )
+                    return response.text or ""
+                except RETRY_EXCEPTIONS as e:
+                    logger.warning(
+                        "primary_llm_overloaded_using_fallback",
+                        primary=self.model_name,
+                        fallback=self.fallback_model,
+                        error=str(e),
+                    )
+                    response = self.client.models.generate_content(
+                        model=self.fallback_model,
+                        contents=contents,
+                        config=self.generation_config,
+                    )
+                    return response.text or ""
+
+            @retry(
+                stop=stop_after_attempt(5),
+                wait=wait_exponential(multiplier=1, min=2, max=30),
+                retry=retry_if_exception_type(RETRY_EXCEPTIONS),
+            )
             def chat(self, messages: list, **kw: Any) -> str:
                 # Convert to genai format
                 contents = []
@@ -633,6 +696,27 @@ def _get_gemini_llm(model: str, **kwargs: Any) -> Any:
                             error=str(e)
                         )
                         return self.fallback.complete(prompt, **kw)
+
+                def complete_with_image(self, prompt: str, image_bytes: bytes, **kw: Any) -> str:
+                    """Multimodal via the new google-genai SDK (bypass LlamaIndex)."""
+                    try:
+                        from google import genai
+                        from google.genai import types as genai_types
+                    except ImportError:
+                        logger.warning("google_genai_not_available_for_multimodal")
+                        return self.complete(prompt, **kw)
+
+                    api_key = os.getenv("GOOGLE_API_KEY")
+                    client = genai.Client(api_key=api_key)
+                    image_part = genai_types.Part.from_bytes(
+                        data=image_bytes, mime_type="image/png",
+                    )
+                    contents = [image_part, prompt]
+                    response = client.models.generate_content(
+                        model=self.model_name.replace("models/", ""),
+                        contents=contents,
+                    )
+                    return response.text or ""
 
                 @retry(
                     stop=stop_after_attempt(5),

@@ -95,6 +95,9 @@ class TreeBuilder:
         # Post-process: merge small nodes into parent
         self._merge_small_nodes(root)
         
+        # Post-process: recursively decompose oversized leaf nodes
+        self._split_large_nodes(root)
+        
         # Count total nodes
         total_nodes = self._count_nodes(root)
         
@@ -290,6 +293,74 @@ class TreeBuilder:
         
         return False
     
+    # Threshold for recursive decomposition of oversized leaf nodes.
+    # Leaf nodes with more content than this are split into navigable
+    # sub-sections so Tree of Thoughts can traverse into them.
+    MAX_LEAF_CHARS = 8000
+
+    def _split_large_nodes(self, node: DocumentNode) -> None:
+        """
+        Post-process: recursively decompose leaf nodes that exceed MAX_LEAF_CHARS.
+
+        Uses semantic chunking (header detection -> paragraph splitting ->
+        sentence splitting) to create meaningful sub-sections.  This ensures
+        the Tree of Thoughts navigator can traverse into large document
+        sections rather than receiving them as monolithic blobs.
+
+        The decomposition is recursive: if a chunk is still too large after
+        the first split, it will be split again on the next pass.
+        """
+        # First, recurse into existing children
+        for child in node.children:
+            self._split_large_nodes(child)
+
+        # Only split leaf nodes (no children) that have oversized content
+        if node.children or not node.content:
+            return
+
+        content_len = len(node.content)
+        if content_len <= self.MAX_LEAF_CHARS:
+            return
+
+        from rnsr.ingestion.text_builder import (
+            _semantic_chunk_text,
+            _infer_header_from_content,
+        )
+
+        segments = _semantic_chunk_text(node.content, chunk_size=self.MAX_LEAF_CHARS)
+
+        # Only split if we got multiple meaningful segments
+        if len(segments) < 2:
+            return
+
+        logger.info(
+            "splitting_large_node",
+            node_id=node.id,
+            header=node.header[:50],
+            original_chars=content_len,
+            new_children=len(segments),
+        )
+
+        # Create child nodes from segments
+        for i, seg in enumerate(segments):
+            header = seg.header or _infer_header_from_content(seg.text)
+            child = DocumentNode(
+                id=f"{node.id}_chunk_{i:03d}",
+                level=node.level + 1,
+                header=header,
+                content=seg.text,
+                page_num=node.page_num,
+            )
+            node.children.append(child)
+
+        # Parent becomes a container: keep a brief summary for context;
+        # full content now lives in the children.
+        node.content = node.content[:200] + "..."
+
+        # Recurse into newly created children in case any are still too large
+        for child in node.children:
+            self._split_large_nodes(child)
+
     def _count_nodes(self, node: DocumentNode) -> int:
         """Recursively count all nodes in the tree."""
         count = 1  # Count this node

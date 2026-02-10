@@ -244,6 +244,54 @@ class SQLiteKVStore:
             "updated_at": row["updated_at"],
         }
     
+    def put_image(self, node_id: str, image_bytes: bytes) -> None:
+        """
+        Store image bytes associated with a node.
+        
+        Uses a separate table so existing text queries are unaffected.
+        """
+        with self._connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS node_images (
+                    node_id TEXT PRIMARY KEY,
+                    image_data BLOB NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute(
+                """
+                INSERT INTO node_images (node_id, image_data)
+                VALUES (?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET
+                    image_data = excluded.image_data
+                """,
+                (node_id, image_bytes),
+            )
+            conn.commit()
+        logger.debug("kv_put_image", node_id=node_id, size=len(image_bytes))
+    
+    def get_image(self, node_id: str) -> bytes | None:
+        """
+        Retrieve image bytes for a node.
+        
+        Returns:
+            Image bytes, or None if no image stored for this node.
+        """
+        with self._connect() as conn:
+            try:
+                cursor = conn.execute(
+                    "SELECT image_data FROM node_images WHERE node_id = ?",
+                    (node_id,),
+                )
+                row = cursor.fetchone()
+            except Exception:
+                # Table may not exist yet
+                return None
+        
+        if row is None:
+            return None
+        return row["image_data"]
+    
     def clear(self) -> int:
         """
         Delete all documents from the store.
@@ -254,6 +302,10 @@ class SQLiteKVStore:
         with self._connect() as conn:
             cursor = conn.execute("DELETE FROM documents")
             count = cursor.rowcount
+            try:
+                conn.execute("DELETE FROM node_images")
+            except Exception:
+                pass  # Table may not exist
             conn.commit()
         
         logger.warning("kv_store_cleared", count=count)
@@ -265,11 +317,13 @@ class InMemoryKVStore:
     In-memory key-value store for testing and ephemeral usage.
     
     API-compatible with SQLiteKVStore.
+    Supports optional image storage per node for vision-augmented navigation.
     """
     
     def __init__(self):
         self._store: dict[str, str] = {}
         self._metadata: dict[str, dict] = {}
+        self._images: dict[str, bytes] = {}
     
     def put(self, node_id: str, content: str) -> str:
         content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
@@ -286,10 +340,19 @@ class InMemoryKVStore:
     def get_batch(self, node_ids: list[str]) -> dict[str, str | None]:
         return {nid: self._store.get(nid) for nid in node_ids}
     
+    def put_image(self, node_id: str, image_bytes: bytes) -> None:
+        """Store image bytes associated with a node."""
+        self._images[node_id] = image_bytes
+    
+    def get_image(self, node_id: str) -> bytes | None:
+        """Retrieve image bytes for a node, or None if no image."""
+        return self._images.get(node_id)
+    
     def delete(self, node_id: str) -> bool:
         if node_id in self._store:
             del self._store[node_id]
             del self._metadata[node_id]
+            self._images.pop(node_id, None)
             return True
         return False
     
@@ -306,6 +369,7 @@ class InMemoryKVStore:
         count = len(self._store)
         self._store.clear()
         self._metadata.clear()
+        self._images.clear()
         return count
 
 

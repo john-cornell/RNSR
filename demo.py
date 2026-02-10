@@ -24,47 +24,44 @@ print("Gradio imported.", flush=True)
 
 # =============================================================================
 # Monkeypatch Gradio to fix the Pydantic v2 schema parsing bug
-# The bug occurs because Pydantic v2 uses `additionalProperties: true` (a boolean)
-# but Gradio's _json_schema_to_python_type expects a dict schema
+# Only needed for Gradio < 6.0 -- Gradio 6 handles Pydantic v2 natively.
+# Kept as a guarded safety net for users who haven't upgraded yet.
 # =============================================================================
-import gradio_client.utils as client_utils
+_gradio_major = int(gr.__version__.split(".")[0]) if hasattr(gr, "__version__") else 0
 
-# Store original functions
-_original_json_schema_to_python_type = client_utils._json_schema_to_python_type
-_original_get_type = client_utils.get_type
+if _gradio_major < 6:
+    import gradio_client.utils as client_utils
 
-def _patched_json_schema_to_python_type(schema, defs=None):
-    """Patched version that handles boolean schemas (e.g., additionalProperties: true)."""
-    # Handle boolean schemas - these mean "any" in JSON Schema
-    if isinstance(schema, bool):
-        return "any" if schema else "never"
-    # Handle None schema
-    if schema is None:
-        return "any"
-    # Call original function
-    return _original_json_schema_to_python_type(schema, defs)
+    _original_json_schema_to_python_type = client_utils._json_schema_to_python_type
+    _original_get_type = client_utils.get_type
 
-def _patched_get_type(schema):
-    """Patched version that handles boolean schemas."""
-    if isinstance(schema, bool):
-        return "any" if schema else "never"
-    if schema is None:
-        return "any"
-    return _original_get_type(schema)
+    def _patched_json_schema_to_python_type(schema, defs=None):
+        """Patched version that handles boolean schemas (e.g., additionalProperties: true)."""
+        if isinstance(schema, bool):
+            return "any" if schema else "never"
+        if schema is None:
+            return "any"
+        return _original_json_schema_to_python_type(schema, defs)
 
-# Apply the patches
-client_utils._json_schema_to_python_type = _patched_json_schema_to_python_type
-client_utils.get_type = _patched_get_type
+    def _patched_get_type(schema):
+        """Patched version that handles boolean schemas."""
+        if isinstance(schema, bool):
+            return "any" if schema else "never"
+        if schema is None:
+            return "any"
+        return _original_get_type(schema)
 
-# Also patch json_schema_to_python_type to handle booleans at the top level
-_original_json_schema_to_python_type_public = client_utils.json_schema_to_python_type
-def _patched_json_schema_to_python_type_public(schema):
-    if isinstance(schema, bool):
-        return "any" if schema else "never"
-    if schema is None:
-        return "any"
-    return _original_json_schema_to_python_type_public(schema)
-client_utils.json_schema_to_python_type = _patched_json_schema_to_python_type_public
+    client_utils._json_schema_to_python_type = _patched_json_schema_to_python_type
+    client_utils.get_type = _patched_get_type
+
+    _original_json_schema_to_python_type_public = client_utils.json_schema_to_python_type
+    def _patched_json_schema_to_python_type_public(schema):
+        if isinstance(schema, bool):
+            return "any" if schema else "never"
+        if schema is None:
+            return "any"
+        return _original_json_schema_to_python_type_public(schema)
+    client_utils.json_schema_to_python_type = _patched_json_schema_to_python_type_public
 
 # =============================================================================
 
@@ -702,20 +699,20 @@ def create_demo():
         button_primary_background_fill_hover="*primary_600",
     )
     
+    custom_css = """
+        .main-header { text-align: center; margin-bottom: 1rem; }
+        .status-card { 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 12px;
+            padding: 1rem;
+            color: white;
+        }
+        .example-btn { font-size: 0.85rem !important; }
+        footer { text-align: center; opacity: 0.7; font-size: 0.85rem; margin-top: 2rem; }
+    """
+    
     with gr.Blocks(
         title="RNSR - Document Q&A",
-        theme=theme,
-        css="""
-            .main-header { text-align: center; margin-bottom: 1rem; }
-            .status-card { 
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                border-radius: 12px;
-                padding: 1rem;
-                color: white;
-            }
-            .example-btn { font-size: 0.85rem !important; }
-            footer { text-align: center; opacity: 0.7; font-size: 0.85rem; margin-top: 2rem; }
-        """
     ) as demo:
         print("Inside gr.Blocks context...", flush=True)
         
@@ -818,7 +815,7 @@ Upload a PDF above and click **Process Document** to begin.
                             show_label=False,
                             placeholder="📄 Upload and process a document first, then ask questions here...",
                             avatar_images=(None, "https://api.dicebear.com/7.x/bottts/svg?seed=rnsr"),
-                            show_copy_button=True,
+                            buttons=["copy"],
                         )
                 
                 # Example questions as clickable buttons
@@ -845,7 +842,7 @@ Upload a PDF above and click **Process Document** to begin.
                     )
                     submit_btn = gr.Button("➤ Send", variant="primary", scale=1, min_width=100)
                 
-                        with gr.Row():
+                    with gr.Row():
                             clear_btn = gr.Button("🗑️ Clear Chat", size="sm", variant="secondary")
                     
                     # Table Query Tab
@@ -924,7 +921,7 @@ Upload a PDF above and click **Process Document** to begin.
             for status in process_document(file, extract_entities):
                 tables_list = get_tables_list()
                 dropdown_choices = get_table_dropdown_choices()
-                dropdown_update = gr.update(choices=dropdown_choices, value=dropdown_choices[0] if dropdown_choices else None)
+                dropdown_update = gr.Dropdown(choices=dropdown_choices, value=dropdown_choices[0] if dropdown_choices else None)
                 yield status, get_tree_visualization(), tables_list, dropdown_update
         
         process_btn.click(
@@ -972,7 +969,7 @@ Upload a PDF above and click **Process Document** to begin.
         # Table query handlers
         def update_table_dropdown():
             choices = get_table_dropdown_choices()
-            return gr.update(choices=choices, value=choices[0] if choices else None)
+            return gr.Dropdown(choices=choices, value=choices[0] if choices else None)
         
         refresh_dropdown_btn.click(
             fn=update_table_dropdown,
@@ -1022,6 +1019,9 @@ Upload a PDF above and click **Process Document** to begin.
             outputs=[msg_input, chatbot]
         )
     
+    # Store theme and css on the demo object so launch() can use them
+    demo._rnsr_theme = theme
+    demo._rnsr_css = custom_css
     print("Demo created, returning...", flush=True)
     return demo
 
@@ -1039,9 +1039,10 @@ if __name__ == "__main__":
     
     demo = create_demo()
     print("Launching demo server...", flush=True)
-    # Disable API docs to workaround the Gradio/Pydantic TypeError
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
         share=False,  # Disabled to avoid slow share link creation
+        theme=demo._rnsr_theme,
+        css=demo._rnsr_css,
     )

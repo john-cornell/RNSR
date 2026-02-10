@@ -147,7 +147,7 @@ class RNSRBenchmarkAdapter:
         self,
         llm_provider: str = "gemini",
         llm_model: str = "gemini-2.5-flash",
-        max_iterations: int = 20,
+        max_iterations: int = 50,
         tot_selection_threshold: float = 0.4,
         tot_dead_end_threshold: float = 0.1,
     ):
@@ -235,10 +235,11 @@ class RNSRBenchmarkAdapter:
             generation_time_s=query_time,
             total_time_s=total_time,
             tree_depth_reached=max_depth,
+            trace=answer_result.get("trace", []),
             metadata={
                 "confidence": answer_result.get("confidence", 0),
                 "variables_used": len(answer_result.get("variables_used", [])),
-            }
+            },
         )
     
     def answer_from_context(
@@ -276,6 +277,20 @@ class RNSRBenchmarkAdapter:
         start_index = time.perf_counter()
         tree = build_tree_from_contexts(contexts, question)
         skeleton, kv_store = build_skeleton_index(tree)
+        
+        # Step 1b: Attach image to root node if available (for vision-augmented ToT)
+        # This stores the image bytes on the tree node so expand_current_node()
+        # can use VisionLLM to produce a text analysis during navigation.
+        if metadata and metadata.get("image_bytes") and hasattr(kv_store, "put_image"):
+            # Attach image to root node (single-page doc images like DocVQA)
+            root_id = tree.root.id
+            kv_store.put_image(root_id, metadata["image_bytes"])
+            # Also attach to all leaf nodes so any traversal path finds it
+            for node_id in skeleton:
+                node = skeleton[node_id]
+                if not node.child_ids:  # leaf node
+                    kv_store.put_image(node_id, metadata["image_bytes"])
+        
         index_time = time.perf_counter() - start_index
         
         # Step 2: Run full RLM navigator (decomposition + variable stitching)
@@ -294,7 +309,65 @@ class RNSRBenchmarkAdapter:
                 tot_dead_end_threshold=self.tot_dead_end_threshold,
             )
             answer = answer_result.get("answer", "")
-                
+
+            # Fallback 1: header-match — present all headers to LLM, pick relevant nodes
+            if (
+                (answer or "").strip().startswith("No relevant content found")
+                and not answer_result.get("variables_used")
+            ):
+                try:
+                    from rnsr.agent.graph import _header_match_fallback, synthesize_answer as _synth
+                    from rnsr.agent.variable_store import VariableStore as _VS
+                    hm_vs = _VS()
+                    hm_pointers = _header_match_fallback(
+                        question=question,
+                        skeleton=skeleton,
+                        kv_store=kv_store,
+                        variable_store=hm_vs,
+                    )
+                    if hm_pointers:
+                        # Build minimal state for synthesis
+                        hm_state = dict(answer_result)
+                        hm_state.setdefault("question", question)
+                        hm_state["variables"] = hm_pointers
+                        hm_state["answer"] = ""
+                        hm_state.setdefault("metadata", metadata or {})
+                        hm_state.setdefault("confidence", 0.0)
+                        hm_state.setdefault("trace", [])
+                        synth_result = _synth(hm_state, hm_vs)
+                        hm_answer = synth_result.get("answer", "")
+                        if hm_answer and not hm_answer.strip().startswith("No relevant content found"):
+                            answer_result["answer"] = hm_answer
+                            answer_result["variables_used"] = hm_pointers
+                            answer_result["confidence"] = synth_result.get("confidence", 0.0)
+                            answer = hm_answer
+                            logger.info("used_header_match_fallback", question_preview=question[:60])
+                except Exception as hm_e:
+                    logger.warning("header_match_fallback_failed", error=str(hm_e))
+
+            # Fallback 2: semantic search — retry with embeddings (existing fallback)
+            if (
+                (answer or "").strip().startswith("No relevant content found")
+                and not answer_result.get("variables_used")
+            ):
+                try:
+                    fallback_result = run_navigator(
+                        question=question,
+                        skeleton=skeleton,
+                        kv_store=kv_store,
+                        max_iterations=self.max_iterations,
+                        use_semantic_search=True,
+                        metadata=metadata,
+                        tot_selection_threshold=self.tot_selection_threshold,
+                        tot_dead_end_threshold=self.tot_dead_end_threshold,
+                    )
+                    fallback_answer = fallback_result.get("answer", "")
+                    if fallback_answer and not (fallback_answer or "").strip().startswith("No relevant content found"):
+                        answer_result = fallback_result
+                        answer = fallback_answer
+                        logger.debug("used_semantic_search_fallback", question_preview=question[:60])
+                except Exception as fb_e:
+                    logger.warning("semantic_search_fallback_failed", error=str(fb_e))
         except Exception as e:
             logger.warning("rnsr_navigation_failed", error=str(e))
             answer = f"Error: {str(e)}"
@@ -774,16 +847,26 @@ class EvaluationSuite:
             workers=self.config.parallel_workers,
         )
         
+        _metrics_set = set(dataset.metrics or []) if getattr(dataset, "metrics", None) else set()
+        use_short_answer = bool(
+            _metrics_set & {"answer_f1", "f1", "exact_match", "anls"}
+        )
+
         def process_question(idx_question: tuple[int, "BenchmarkQuestion"]) -> dict[str, Any]:
             """Process a single question (helper for parallel execution)."""
             i, question = idx_question
             logger.debug("processing_question", index=i, question=question.question[:50])
-            
+            meta = dict(question.metadata or {})
+            if use_short_answer:
+                meta["use_short_answer"] = True
+            # Pass reasoning_type so arithmetic-aware synthesis can detect question type
+            if question.reasoning_type:
+                meta.setdefault("reasoning_type", question.reasoning_type)
             try:
                 result = self.rnsr.answer_from_context(
                     question=question.question,
                     contexts=question.context,
-                    metadata=question.metadata,
+                    metadata=meta,
                 )
                 
                 pred_entry = {
@@ -840,9 +923,22 @@ class EvaluationSuite:
         
         # Compute metrics
         metrics: dict[str, Any] = {}
-        if "answer_f1" in dataset.metrics or "answer_em" in dataset.metrics or "accuracy" in dataset.metrics:
+        metric_set = set(dataset.metrics or [])
+        if metric_set & {"answer_f1", "answer_em", "accuracy", "f1", "exact_match"}:
             multi_hop = evaluate_multihop(predictions, dataset.questions)
             metrics = multi_hop.to_dict()
+        elif "anls" in metric_set:
+            # ANLS scoring for DocVQA
+            from rnsr.benchmarks.docvqa_bench import _compute_anls
+            anls_scores = []
+            for pred, q in zip(predictions, dataset.questions):
+                pred_answer = pred.get("answer", "")
+                # Ground truth may have multiple acceptable answers (stored in metadata)
+                gt_answers = (q.metadata or {}).get("all_answers") or [q.answer]
+                max_anls = max((_compute_anls(pred_answer, gt) for gt in gt_answers), default=0.0)
+                anls_scores.append(max_anls)
+            avg_anls = sum(anls_scores) / len(anls_scores) if anls_scores else 0.0
+            metrics = {"anls": avg_anls, "f1": avg_anls}  # Report ANLS as the primary metric
         else:
             # Retrieval metrics (for BEIR)
             metrics = self._compute_retrieval_metrics(predictions, dataset.questions)
@@ -958,9 +1054,20 @@ class EvaluationSuite:
                 })
         
         # Compute metrics (same as RNSR)
-        if "answer_f1" in dataset.metrics or "answer_em" in dataset.metrics or "accuracy" in dataset.metrics:
+        metric_set = set(dataset.metrics or [])
+        if metric_set & {"answer_f1", "answer_em", "accuracy", "f1", "exact_match"}:
             multi_hop = evaluate_multihop(predictions, dataset.questions)
             metrics = multi_hop.to_dict()
+        elif "anls" in metric_set:
+            from rnsr.benchmarks.docvqa_bench import _compute_anls
+            anls_scores = []
+            for pred, q in zip(predictions, dataset.questions):
+                pred_answer = pred.get("answer", "")
+                gt_answers = (q.metadata or {}).get("all_answers") or [q.answer]
+                max_anls = max((_compute_anls(pred_answer, gt) for gt in gt_answers), default=0.0)
+                anls_scores.append(max_anls)
+            avg_anls = sum(anls_scores) / len(anls_scores) if anls_scores else 0.0
+            metrics = {"anls": avg_anls, "f1": avg_anls}
         else:
             metrics = {"f1": 0.0}  # Retrieval metrics not applicable
         

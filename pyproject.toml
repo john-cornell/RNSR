@@ -77,7 +77,7 @@ benchmarks = [
     "ragas>=0.1.0",
 ]
 demo = [
-    "gradio>=4.0.0",
+    "gradio>=6.0.0",
 ]
 dev = [
     "pytest>=7.0.0",

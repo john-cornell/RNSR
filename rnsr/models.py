@@ -77,6 +77,7 @@ class DocumentNode(BaseModel):
     page_num: int | None = None
     bbox: BoundingBox | None = None
     children: list[DocumentNode] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def child_ids(self) -> list[str]:

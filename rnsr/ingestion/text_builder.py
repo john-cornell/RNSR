@@ -54,12 +54,18 @@ class TextSegment:
     level: int = 0
     header: str = ""
     segment_id: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    
+    # Class-level counter for generating unique segment IDs
+    _id_counter: int = 0
     
     def __post_init__(self):
         if not self.segment_id:
-            # Generate stable ID from content hash
+            # Generate unique ID from content hash + monotonic counter
+            # Content hash alone can collide when segments share the same first 100 chars
             content_hash = hashlib.md5(self.text[:100].encode()).hexdigest()[:8]
-            self.segment_id = f"seg_{content_hash}"
+            TextSegment._id_counter += 1
+            self.segment_id = f"seg_{content_hash}_{TextSegment._id_counter}"
 
 
 # =============================================================================
@@ -272,6 +278,7 @@ def _build_hierarchy_from_segments(
                 header=seg.header or f"Section {len(root.children) + 1}",
                 level=seg.level + 1,  # Root is level 0
                 children=[],
+                metadata=seg.metadata,
             )
             
             # Find appropriate parent
@@ -293,8 +300,18 @@ def _build_hierarchy_from_segments(
             children=[],
         )
         
-        if len(segments) <= max_children:
-            # All segments as direct children
+        # Check if segments already have meaningful headers (from bracket
+        # extraction or similar).  When they do, the segments represent
+        # natural document sections and should NOT be grouped arbitrarily.
+        has_meaningful_headers = all(
+            s.header
+            and not s.header.startswith("Context ")
+            and not s.header.startswith("Section ")
+            for s in segments
+        )
+
+        if has_meaningful_headers or len(segments) <= max_children:
+            # All segments as direct children — preserve natural structure
             for i, seg in enumerate(segments):
                 root.children.append(DocumentNode(
                     id=seg.segment_id,
@@ -302,6 +319,7 @@ def _build_hierarchy_from_segments(
                     header=seg.header or f"Section {i + 1}",
                     level=1,
                     children=[],
+                    metadata=seg.metadata,
                 ))
         else:
             # Group into intermediate nodes
@@ -325,6 +343,7 @@ def _build_hierarchy_from_segments(
                         header=seg.header or "Segment",
                         level=2,
                         children=[],
+                        metadata=seg.metadata,
                     ))
                 
                 root.children.append(group_node)
@@ -342,6 +361,75 @@ def _get_tree_depth(node: DocumentNode) -> int:
     if not node.children:
         return 1
     return 1 + max(_get_tree_depth(child) for child in node.children)
+
+
+# =============================================================================
+# Bracket Header Extraction
+# =============================================================================
+
+def _extract_bracket_header(text: str) -> tuple[str, str]:
+    """Extract a [HEADER] marker from the start of a text string.
+
+    Many benchmark datasets prefix each context with a bracket-enclosed
+    section name, e.g. ``[TITLE]``, ``[ABSTRACT]``, ``[TABLE 1]``.  This
+    function extracts that header and returns ``(header, remaining_text)``.
+
+    If no bracket header is found, returns ``("", original_text)``.
+    """
+    match = re.match(r'^\[([^\]]+)\]\s*\n?', text)
+    if match:
+        return match.group(1).strip(), text[match.end():].strip()
+    return "", text
+
+
+# =============================================================================
+# Generic Header Inference
+# =============================================================================
+
+# Headers that carry no navigational value — when a bracket header matches
+# one of these, we replace it with a content-derived header.
+_GENERIC_HEADERS = {"TEXT", "PARAGRAPH", "CONTENT", "SECTION", "SEGMENT"}
+
+
+def _infer_header_from_content(text: str, max_len: int = 80) -> str:
+    """Derive a short descriptive header from the first line of content.
+
+    For **table-like content** (contains ``|`` separators), extracts the
+    first few column names.  For **text content**, takes the first line
+    truncated at a word boundary.
+
+    Returns:
+        A non-empty header string (at most *max_len* characters).
+    """
+    if not text or not text.strip():
+        return "Content"
+
+    first_line = text.strip().split("\n")[0].strip()
+
+    # Skip lines that are purely separators (e.g. "---", "===", "|||")
+    if first_line and all(c in "-=|+ \t" for c in first_line):
+        # Try the second line instead
+        lines = text.strip().split("\n")
+        first_line = lines[1].strip() if len(lines) > 1 else "Content"
+        if all(c in "-=|+ \t" for c in first_line):
+            return "Content"
+
+    # Table-like content: extract column names from the first row
+    if "|" in first_line:
+        cols = [c.strip() for c in first_line.split("|") if c.strip()]
+        if cols:
+            header = " | ".join(cols[:4])
+            if len(cols) > 4:
+                header += " | ..."
+            return header[:max_len]
+
+    # Text content: use first line, truncated at a word boundary
+    if not first_line:
+        return "Content"
+    if len(first_line) <= max_len:
+        return first_line
+    truncated = first_line[:max_len].rsplit(" ", 1)[0]
+    return (truncated + "...") if truncated else first_line[:max_len]
 
 
 # =============================================================================
@@ -395,22 +483,56 @@ def build_tree_from_text(
                 ingestion_tier=2,
             )
         
-        # If contexts are already chunked, use them directly
-        if all(len(ctx) < chunk_size * 2 for ctx in text):
-            segments = [
-                TextSegment(
-                    text=ctx,
+        # First pass: try to extract bracket headers from contexts.
+        # If most contexts have bracket headers (e.g. [TITLE], [ABSTRACT],
+        # [TABLE 1]) they represent natural document sections and should be
+        # preserved as-is regardless of size.
+        headers_found = 0
+        for ctx in text:
+            if ctx.strip() and _extract_bracket_header(ctx)[0]:
+                headers_found += 1
+
+        has_bracket_headers = headers_found > len(text) // 2
+
+        if has_bracket_headers or all(len(ctx) < chunk_size * 2 for ctx in text):
+            # Use contexts directly — either they have meaningful bracket
+            # headers (natural sections) or they're small enough already.
+            segments = []
+            for i, ctx in enumerate(text):
+                if not ctx.strip():
+                    continue
+                # Extract bracket headers like [TITLE], [ABSTRACT], [TABLE 1]
+                header, body = _extract_bracket_header(ctx)
+                seg_metadata: dict[str, Any] = {}
+                if header and header.upper().startswith("TABLE"):
+                    seg_metadata["is_table"] = True
+                # Replace generic/uninformative headers with content-
+                # derived ones so ToT can differentiate between nodes.
+                if header and header.upper() in _GENERIC_HEADERS:
+                    header = _infer_header_from_content(body or ctx)
+                segments.append(TextSegment(
+                    text=body if header else ctx,
                     start_char=0,
                     end_char=len(ctx),
-                    header=f"Context {i + 1}",
-                )
-                for i, ctx in enumerate(text)
-                if ctx.strip()
-            ]
+                    header=header or f"Context {i + 1}",
+                    metadata=seg_metadata,
+                ))
         else:
-            # Combine and re-chunk
+            # Combine and re-chunk (plain text contexts that are too large)
             combined = "\n\n---\n\n".join(text)
             segments = _semantic_chunk_text(combined, chunk_size)
+            # Unify variable naming: use Context 1, Context 2, ... so pointers become $CONTEXT_1, $CONTEXT_2
+            segments = [
+                TextSegment(
+                    text=seg.text,
+                    start_char=seg.start_char,
+                    end_char=seg.end_char,
+                    level=seg.level,
+                    header=seg.header or f"Context {i + 1}",
+                    segment_id=seg.segment_id,
+                )
+                for i, seg in enumerate(segments)
+            ]
     else:
         segments = _semantic_chunk_text(text, chunk_size)
     

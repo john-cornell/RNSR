@@ -406,11 +406,12 @@ class RLMEntityExtractor:
         )
         
         # Generate code prompt
-        prompt = f"{RLM_ENTITY_EXTRACTION_SYSTEM}\n\n{RLM_EXTRACTION_PROMPT.format(
+        extraction_prompt = RLM_EXTRACTION_PROMPT.format(
             header=header,
             content_preview=content[:2000],
             content_length=len(content),
-        )}"
+        )
+        prompt = f"{RLM_ENTITY_EXTRACTION_SYSTEM}\n\n{extraction_prompt}"
         
         for attempt in range(self.max_code_attempts):
             try:
