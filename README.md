@@ -457,57 +457,162 @@ The more you use RNSR, the better it gets at understanding your domain.
 
 ## How It Works
 
+### High-Level System Overview
+
+```mermaid
+graph LR
+    PDF["📄 PDF Document"]
+    ING["🔍 Ingestion"]
+    TREE["🌳 Hierarchical Tree"]
+    SKEL["📋 Skeleton Index"]
+    KG["🧠 Knowledge Graph"]
+    NAV["🧭 RLM Navigator"]
+    ANS["✅ Grounded Answer"]
+
+    PDF --> ING
+    ING --> TREE
+    TREE --> SKEL
+    TREE --> KG
+    SKEL --> NAV
+    KG --> NAV
+    NAV --> ANS
+
+    style PDF fill:#e1f5fe
+    style KG fill:#f3e5f5
+    style ANS fill:#e8f5e9
+```
+
 ### Document Ingestion Pipeline
 
-```
-PDF → Font Analysis → Header Classification → Tree Building → Skeleton Index
-         ↓                    ↓                    ↓              ↓
-   Detect font sizes   Classify H1/H2/H3    Build hierarchy   Create summaries
-                                                  ↓
-                                        Multi-doc detection
-                                        (page number resets)
+```mermaid
+flowchart TD
+    A["📄 PDF Input"] --> B["Font Histogram Analysis"]
+    B --> C["Header Classification\n(H1 / H2 / H3)"]
+    C --> D{"Multiple Documents?"}
+    D -->|"Yes (page-number resets)"| E["Split into Sub-Documents"]
+    D -->|No| F["Build Hierarchical Tree"]
+    E --> F
+    F --> G["Skeleton Index\n(lightweight summaries)"]
+    F --> H["KV Store\n(full section content)"]
+    F --> I["Table Detection\n& Parsing"]
+
+    style A fill:#e1f5fe
+    style F fill:#fff3e0
+    style G fill:#e8f5e9
+    style H fill:#e8f5e9
+    style I fill:#e8f5e9
 ```
 
 ### Query Processing
 
-```
-Question → Clarify → Pre-Filter → Tree Navigation → Answer → Self-Reflect → Verify
-              ↓           ↓              ↓             ↓           ↓           ↓
-        Ask if ambig  Keyword scan  ToT reasoning  Synthesize  Critique   Fact-check
-                                         ↓                        ↓
-                                  Sub-LLM recursion        Improve answer
-                                  (complex queries)        (if issues)
+```mermaid
+flowchart LR
+    Q["❓ Question"] --> CL["Clarify\nambiguity?"]
+    CL --> PF["Pre-Filter\n(keyword scan)"]
+    PF --> NAV["RLM Tree\nNavigation"]
+    NAV --> SYN["Synthesise\nAnswer"]
+    SYN --> SR["Self-Reflect\n& Critique"]
+    SR --> VER["Verify\n(optional)"]
+    VER --> A["✅ Answer +\nProvenance"]
+
+    NAV -->|"complex query"| SUB["Sub-LLM\nRecursion"]
+    SUB --> NAV
+
+    style Q fill:#e1f5fe
+    style A fill:#e8f5e9
+    style NAV fill:#fff3e0
 ```
 
 ### Entity Extraction (RLM Unified, Parallel)
 
+The extractor receives **ancestor context** from the skeleton tree so it always
+knows *whose* data it is extracting (e.g. the primary applicant's passport).
+
+```mermaid
+flowchart TD
+    DOC["🌳 Document Tree"] --> SPLIT["Split into\nSkeleton Nodes"]
+    SPLIT --> CTX["Build Ancestor Context\nper Node"]
+    CTX --> POOL["ThreadPool\n(8 workers)"]
+
+    subgraph PER_NODE ["Per-Node Extraction"]
+        direction TB
+        ANC["📍 Ancestor Breadcrumb\n+ Subject Hint"] --> LLM["LLM Writes\nExtraction Code"]
+        LLM --> EXEC["Execute on\nDOC_VAR"]
+        EXEC --> TOT["ToT Validation\n(probability scores)"]
+        TOT --> ENT["Entities &\nRelationships"]
+    end
+
+    POOL --> PER_NODE
+    PER_NODE --> MERGE["Merge Results"]
+    MERGE --> KG["🧠 Knowledge Graph"]
+    MERGE --> LEARN["📚 Learn New Types\n(~/.rnsr/)"]
+
+    style DOC fill:#e1f5fe
+    style KG fill:#f3e5f5
+    style LEARN fill:#fce4ec
+    style ANC fill:#fff9c4
 ```
-Document → Split into nodes → ThreadPool (8 workers) → Merge results → Knowledge Graph
-                                     ↓ (per node)
-                              LLM writes code → Execute on DOC_VAR → ToT validation
-                                    ↓                   ↓                   ↓
-                             Generates Python     Grounded results   Probability scores
-                                                        ↓
-                                                All tied to exact text spans
-                                                        ↓
-                                              Learned types persisted to ~/.rnsr/
+
+**Ancestor context example** — when extracting *Identity Documents* (a child of
+*PRIMARY APPLICANT DETAILS*), the prompt receives:
+
+```
+Document path: Form 80 > PRIMARY APPLICANT DETAILS > Identity Documents
+Subject context: Title: Mr | Family Name: Sorenssen | Given Names: GeoV William | ...
+```
+
+This lets the LLM produce `Passport PA1234567 → BELONGS_TO → GeoV William Sorenssen`
+instead of the meaningless `Passport → MENTIONS → PA1234567`.
+
+### Knowledge Graph Self-Learning
+
+Relationship types that the LLM discovers but don't match a canonical type are
+persisted to `~/.rnsr/learned_relationship_types.json`. On future documents the
+learned types are injected back into the extraction prompt, creating a feedback
+loop that improves with use.
+
+```mermaid
+flowchart LR
+    EXT["Extraction\nResult"] --> CHK{"Type matches\ncanonical?"}
+    CHK -->|Yes| KG["Knowledge Graph"]
+    CHK -->|No → OTHER| REC["Record in\nRegistry"]
+    REC --> AUTO["Auto-Suggest\nCanonical Mapping"]
+    AUTO --> JSON["💾 ~/.rnsr/\nlearned_*.json"]
+    JSON -->|"Next extraction"| PROMPT["Inject into\nLLM Prompt"]
+    PROMPT --> EXT
+
+    style JSON fill:#fce4ec
+    style KG fill:#e8f5e9
+    style PROMPT fill:#fff9c4
 ```
 
 ### RLM Navigation Architecture (ToT + REPL Integration)
 
-RNSR uses a unique combination of Tree of Thoughts (ToT) reasoning and a REPL (Read-Eval-Print Loop) environment for document navigation. This is what sets RNSR apart from naive RAG approaches:
+RNSR uses a unique combination of Tree of Thoughts (ToT) reasoning and a REPL (Read-Eval-Print Loop) environment for document navigation. This is what sets RNSR apart from naive RAG approaches.
 
 **The Problem with Naive RAG:**
 Traditional RAG splits documents into chunks, embeds them, and retrieves based on similarity. This loses hierarchical structure and often retrieves irrelevant chunks for complex queries.
 
 **RNSR's RLM Navigation Solution:**
 
-```
-Query → NavigationREPL → LLM Generates Code → Execute → Findings → ToT Validation → Answer
-           ↓                    ↓                ↓          ↓            ↓
-    Expose document       search_tree()      Find relevant  Store     Verify with
-    as environment        navigate_to()      nodes          findings  probabilities
-                          get_content()
+```mermaid
+flowchart TD
+    Q["❓ Query"] --> REPL["NavigationREPL\n(document as environment)"]
+
+    subgraph LOOP ["Iterative Code-Generation Loop"]
+        direction TB
+        REPL --> GEN["LLM Generates\nPython Code"]
+        GEN --> RUN["Execute Code\n(search_tree, navigate_to, …)"]
+        RUN --> FIND["Store Findings"]
+        FIND -->|"Need more info"| REPL
+        FIND -->|"ready_to_synthesize()"| VAL["ToT Validation\n(probability scores)"]
+    end
+
+    VAL --> ANS["✅ Grounded Answer\n+ Citations"]
+
+    style Q fill:#e1f5fe
+    style ANS fill:#e8f5e9
+    style GEN fill:#fff3e0
 ```
 
 **How it works:**
@@ -555,11 +660,65 @@ Query → NavigationREPL → LLM Generates Code → Execute → Findings → ToT
 
 ## Architecture
 
+```mermaid
+graph TD
+    CLIENT["client.py\nHigh-Level API"]
+
+    subgraph INGESTION ["ingestion/"]
+        P["pipeline.py"]
+        FH["font_histogram.py"]
+        HC["header_classifier.py"]
+        TB["tree_builder.py"]
+        TP["table_parser.py"]
+        CP["chart_parser.py"]
+    end
+
+    subgraph INDEXING ["indexing/"]
+        SI["skeleton_index.py"]
+        KV["kv_store.py"]
+        KGR["knowledge_graph.py"]
+        SS["semantic_search.py"]
+    end
+
+    subgraph EXTRACTION ["extraction/"]
+        RUE["rlm_unified_extractor.py"]
+        LT["learned_types.py"]
+        EL["entity_linker.py"]
+        MOD["models.py"]
+    end
+
+    subgraph AGENT ["agent/"]
+        RN["rlm_navigator.py"]
+        NR["nav_repl.py"]
+        PROV["provenance.py"]
+        LC["llm_cache.py"]
+        SR["self_reflection.py"]
+        RM["reasoning_memory.py"]
+        QC["query_clarifier.py"]
+    end
+
+    LLM["llm.py\nMulti-Provider Abstraction"]
+
+    CLIENT --> INGESTION
+    CLIENT --> INDEXING
+    CLIENT --> EXTRACTION
+    CLIENT --> AGENT
+    AGENT --> LLM
+    EXTRACTION --> LLM
+    INGESTION --> INDEXING
+
+    style CLIENT fill:#e1f5fe
+    style LLM fill:#fff3e0
+```
+
+<details>
+<summary>File tree (plain text)</summary>
+
 ```
 rnsr/
 ├── agent/                   # Query processing
 │   ├── rlm_navigator.py     # Main navigation agent (RLM + ToT)
-│   ├── nav_repl.py          # NavigationREPL for code-based navigation (NEW)
+│   ├── nav_repl.py          # NavigationREPL for code-based navigation
 │   ├── repl_env.py          # Base REPL environment
 │   ├── provenance.py        # Citation tracking
 │   ├── llm_cache.py         # Response caching
@@ -569,7 +728,7 @@ rnsr/
 │   ├── graph.py             # LangGraph workflow
 │   └── variable_store.py    # Context management
 ├── extraction/              # Entity/relationship extraction
-│   ├── rlm_unified_extractor.py  # Best extractor (NEW)
+│   ├── rlm_unified_extractor.py  # Unified extractor (RLM + ToT)
 │   ├── learned_types.py     # Adaptive type learning
 │   ├── entity_linker.py     # Cross-document linking
 │   └── models.py            # Entity/Relationship models
@@ -582,13 +741,15 @@ rnsr/
 │   ├── pipeline.py          # Main ingestion orchestrator
 │   ├── font_histogram.py    # Font-based structure detection
 │   ├── header_classifier.py # H1/H2/H3 classification
-│   ├── table_parser.py      # Table extraction (NEW)
-│   ├── chart_parser.py      # Chart interpretation (NEW)
+│   ├── table_parser.py      # Table extraction
+│   ├── chart_parser.py      # Chart interpretation
 │   └── tree_builder.py      # Hierarchical tree construction
 ├── llm.py                   # Multi-provider LLM abstraction
 ├── client.py                # High-level API
 └── models.py                # Data structures
 ```
+
+</details>
 
 ## API Reference
 

@@ -55,12 +55,29 @@ class RelationType(str, Enum):
     MENTIONS = "mentions"           # Entity X is mentioned in Section Y
     DEFINED_IN = "defined_in"       # Entity X is defined/introduced in Section Y
     
-    # Entity-to-Entity relationships
+    # Person / ownership relationships
+    BELONGS_TO = "belongs_to"            # Document/asset X belongs to Person Y
+    EMPLOYED_AT = "employed_at"          # Person X is/was employed at Org Y
+    BORN_IN = "born_in"                  # Person X was born in Location Y
+    SPOUSE_OF = "spouse_of"              # Person X is the spouse of Person Y
+    CHILD_OF = "child_of"               # Person X is the child of Person Y
+    SIBLING_OF = "sibling_of"           # Person X is the sibling of Person Y
+    
+    # Document / reference relationships
+    ISSUED_BY = "issued_by"              # Document X was issued by Org/Country Y
+    HAS_QUALIFICATION = "has_qualification"  # Person X holds Qualification Y
+    LOCATED_IN = "located_in"            # Entity X is located in Location Y
+    HAS_CONTACT = "has_contact"          # Person/Org X has contact detail Y
+    
+    # Temporal relationships
     TEMPORAL_BEFORE = "temporal_before"  # Event X occurred before Event Y
     TEMPORAL_AFTER = "temporal_after"    # Event X occurred after Event Y
-    CAUSAL = "causal"                    # Action X caused/led to Outcome Y
+    HAS_DATE = "has_date"               # Entity X has associated Date Y
+    
+    # Organisational / legal relationships
     AFFILIATED_WITH = "affiliated_with"  # Person X is affiliated with Org Y
     PARTY_TO = "party_to"                # Entity X is party to Document/Event Y
+    CAUSAL = "causal"                    # Action X caused/led to Outcome Y
     
     # Section-to-Section relationships
     SUPPORTS = "supports"           # Section X supports claim in Section Y

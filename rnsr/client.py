@@ -421,9 +421,62 @@ class RNSRClient:
         # Create new knowledge graph (in-memory for now)
         kg = KnowledgeGraph(":memory:")
 
-        # Prepare work items: (node_id, header, content)
+        # -----------------------------------------------------------------
+        # Build ancestor breadcrumb + subject context for each node.
+        #
+        # For a node like:
+        #   root > Form 80 Data > PRIMARY APPLICANT DETAILS > Identity Documents
+        # we build:
+        #   breadcrumb = "Form 80 Data > PRIMARY APPLICANT DETAILS > Identity Documents"
+        #   subject_hint = content from the first leaf sibling that contains a person's name
+        #
+        # This lets the LLM know that "Identity Documents" belongs to the
+        # primary applicant (GeoV William Sorenssen), not to a nameless entity.
+        # -----------------------------------------------------------------
+        def _build_ancestor_context(node_id: str) -> str:
+            """Walk up the tree and build a breadcrumb + subject hint."""
+            parts: list[str] = []
+            current = node_id
+            while current:
+                node = skeleton.get(current)
+                if not node:
+                    break
+                parts.append(node.header)
+                current = node.parent_id
+            parts.reverse()
+            breadcrumb = " > ".join(parts)
+
+            # Try to find the "subject" — usually the first sibling leaf node
+            # (Personal Information) under the nearest parent that has a
+            # person-level header (e.g. PRIMARY APPLICANT DETAILS).
+            subject_hint = ""
+            node = skeleton.get(node_id)
+            if node and node.parent_id:
+                parent = skeleton.get(node.parent_id)
+                if parent and parent.child_ids:
+                    # Look at the first child — it's usually "Personal Information"
+                    first_child_id = parent.child_ids[0]
+                    if first_child_id != node_id:
+                        first_content = kv_store.get(first_child_id) or ""
+                        # Extract a short subject snippet (first ~300 chars)
+                        if first_content:
+                            subject_hint = first_content[:300]
+
+            lines = [f"Document path: {breadcrumb}"]
+            if subject_hint:
+                lines.append(
+                    f"Subject context (from sibling section): {subject_hint}"
+                )
+            return "\n".join(lines)
+
+        # Prepare work items: (node_id, header, content, ancestor_context)
         work_items = [
-            (node_id, node.header, kv_store.get(node_id) or "")
+            (
+                node_id,
+                node.header,
+                kv_store.get(node_id) or "",
+                _build_ancestor_context(node_id),
+            )
             for node_id, node in skeleton.items()
         ]
 
@@ -432,12 +485,13 @@ class RNSRClient:
 
         def _extract_node(item):
             """Run extraction for a single node (executed in worker thread)."""
-            node_id, header, content = item
+            node_id, header, content, ancestor_context = item
             return extract_entities_and_relationships(
                 node_id=node_id,
                 doc_id=doc_id,
                 header=header,
                 content=content,
+                ancestor_context=ancestor_context,
             )
 
         entity_count = 0

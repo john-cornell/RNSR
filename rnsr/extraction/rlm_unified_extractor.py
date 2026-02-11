@@ -69,7 +69,32 @@ You must write Python code to extract both entities and relationships.
 ## Your Task:
 Write Python code that extracts:
 1. ENTITIES: People, organizations, dates, money, locations, legal concepts, etc.
-2. RELATIONSHIPS: How entities relate to each other and to the document
+2. RELATIONSHIPS: **Meaningful semantic connections between entities.**
+
+## CRITICAL: Relationship Extraction Rules
+
+Relationships MUST connect real-world entities to each other in ways that a human would
+describe.  DO NOT create relationships between a table header and a cell value — instead
+figure out **which entity** the row is about and link it.
+
+Good examples:
+- Passport PA1234567 → BELONGS_TO → GeoV William Sorenssen  (person owns the document)
+- GeoV William Sorenssen → EMPLOYED_AT → Downer Engineering  (person works at org)
+- GeoV William Sorenssen → BORN_IN → Brisbane               (person born in location)
+- GeoV William Sorenssen → SPOUSE_OF → Lisa Marie Krar      (person-to-person)
+- GeoV William Sorenssen → HAS_QUALIFICATION → Bachelor of Engineering
+- Lisa Marie Krar → CHILD_OF → Margaret Anne Sorenssen       (family link)
+- Passport PA1234567 → ISSUED_BY → Australia                 (document issuer)
+- SRM Migration → HAS_CONTACT → 0410 031 651                (org has phone)
+
+Bad examples (DO NOT produce these):
+- Passport → MENTIONS → PA1234567           (just echoing table cells)
+- Passport → HAS_DATE → 2020-01-10          (a date alone without the person)
+- Residential Address → REFERENCES → 122A…  (the label is not an entity)
+
+When processing a table row, identify the **subject entity** the row describes (usually a
+person, document, or organisation named earlier) and make that subject the source or
+target of the relationship.
 
 ## Output Format:
 ```python
@@ -87,18 +112,15 @@ for match in re.finditer(r'pattern', SECTION_CONTENT):
         "confidence": 0.9
     }})
 
-# Extract relationships between entities
-# Look for patterns like "X is affiliated with Y", "X caused Y", etc.
-for match in re.finditer(r'(\w+)\s+(?:is|was)\s+(?:employed|hired)\s+by\s+(\w+)', SECTION_CONTENT):
-    relationships.append({{
-        "source_text": match.group(1),
-        "target_text": match.group(2),
-        "type": "AFFILIATED_WITH",
-        "evidence": match.group(),
-        "start": match.start(),
-        "end": match.end(),
-        "confidence": 0.85
-    }})
+# Extract SEMANTIC relationships between entities
+# Think: "Who/what is this about?" → "What is the connection?" → "To whom/what?"
+relationships.append({{
+    "source_text": "GeoV William Sorenssen",  # the real-world entity
+    "target_text": "Downer Engineering",       # the related entity
+    "type": "EMPLOYED_AT",                     # meaningful relationship type
+    "evidence": "GeoV William Sorenssen works at Downer Engineering as Project Manager",
+    "confidence": 0.9
+}})
 
 store_variable("ENTITIES", entities)
 store_variable("RELATIONSHIPS", relationships)
@@ -108,9 +130,25 @@ store_variable("RELATIONSHIPS", relationships)
 PERSON, ORGANIZATION, DATE, MONETARY, LOCATION, REFERENCE, DOCUMENT, EVENT, LEGAL_CONCEPT
 {learned_entity_types}
 
-## Relationship Types:
-MENTIONS, TEMPORAL_BEFORE, TEMPORAL_AFTER, CAUSAL, SUPPORTS, CONTRADICTS, 
-AFFILIATED_WITH, PARTY_TO, REFERENCES, SUPERSEDES, AMENDS
+## Relationship Types (use the most specific type that fits):
+BELONGS_TO      — Document/asset belongs to a person or org
+EMPLOYED_AT     — Person works/worked at an organisation
+BORN_IN         — Person was born in a location
+SPOUSE_OF       — Person is the spouse of another person
+CHILD_OF        — Person is the child of another person
+SIBLING_OF      — Person is the sibling of another person
+ISSUED_BY       — Document/credential issued by org or country
+HAS_QUALIFICATION — Person holds a degree, certification, or skill
+LOCATED_IN      — Entity is located in a place
+HAS_CONTACT     — Person or org has a phone, email, or address
+HAS_DATE        — Entity has an associated date (use sparingly; prefer more specific types)
+AFFILIATED_WITH — Person/org is affiliated with another org
+PARTY_TO        — Entity is party to a document, event, or agreement
+TEMPORAL_BEFORE — Event X occurred before Event Y
+TEMPORAL_AFTER  — Event X occurred after Event Y
+CAUSAL          — Action X caused Outcome Y
+REFERENCES      — Section/entity references another entity
+MENTIONS        — Entity mentioned in a section (section-level only)
 {learned_relationship_types}
 
 Write code appropriate for this specific document."""
@@ -119,6 +157,9 @@ Write code appropriate for this specific document."""
 RLM_UNIFIED_EXTRACTION_PROMPT = """Document section to extract from:
 
 Section Header: {header}
+
+{ancestor_context}
+
 Section Content (first 3000 chars):
 ---
 {content_preview}
@@ -126,11 +167,33 @@ Section Content (first 3000 chars):
 
 Total section length: {content_length} characters
 
-Write Python code to extract ALL entities and relationships.
-Consider:
-1. What types of entities appear? (people, companies, dates, money, etc.)
-2. How are entities related? (affiliated_with, party_to, temporal, causal)
-3. What domain-specific patterns exist? (legal terms, citations, etc.)
+Write Python code to extract ALL entities and SEMANTIC relationships.
+
+Step-by-step:
+1. **Use the Document Path and Subject Context above** to identify the SUBJECT of this
+   section.  The subject is usually a person, organisation, or document described by the
+   parent section.  For example, if the path is
+   "Form 80 > PRIMARY APPLICANT DETAILS > Identity Documents" and the subject context
+   shows "Family Name: Sorenssen, Given Names: GeoV William", then the subject is
+   **GeoV William Sorenssen** and every entity here relates to him.
+
+2. Extract all entities (people, orgs, dates, locations, qualifications, documents, etc.).
+   **Include the subject as an entity** even if their name doesn't appear literally in
+   this section — you know it from the parent context.
+
+3. For each entity, ask: "How does this relate to the **subject** or to other entities?"
+   Create relationships that connect entities to each other — NOT to table headers/labels.
+
+IMPORTANT — For tables, each row should produce a relationship FROM the subject TO the value:
+  Subject: "GeoV William Sorenssen" (from parent context)
+  Row: "| Passport | PA1234567 | Australia | 10 January 2020 | 10 January 2030 |"
+  → Passport PA1234567 → BELONGS_TO → GeoV William Sorenssen
+  → Passport PA1234567 → ISSUED_BY → Australia
+  → GeoV William Sorenssen → HAS_DATE → 10 January 2020 (passport issue date)
+
+  Row: "| BHP Billiton | Project Engineer | Jan 2015 | Feb 2018 | Australia |"
+  → GeoV William Sorenssen → EMPLOYED_AT → BHP Billiton
+  → GeoV William Sorenssen → HAS_QUALIFICATION → Project Engineer
 
 End with:
 store_variable("ENTITIES", entities)
@@ -429,6 +492,7 @@ class RLMUnifiedExtractor:
         content: str,
         page_num: int | None = None,
         document_text: str | None = None,
+        ancestor_context: str | None = None,
     ) -> RLMUnifiedResult:
         """
         Extract entities AND relationships using unified RLM approach.
@@ -447,6 +511,9 @@ class RLMUnifiedExtractor:
             content: Section content.
             page_num: Page number.
             document_text: Full document text for DOC_VAR.
+            ancestor_context: Hierarchical breadcrumb + subject hint
+                so the extractor knows the broader context (e.g. whose
+                passport details these are).
             
         Returns:
             RLMUnifiedResult with entities and relationships.
@@ -477,6 +544,7 @@ class RLMUnifiedExtractor:
             document_text=document_text or content,
             learned_entity_types=learned_entity_types,
             learned_relationship_types=learned_relationship_types,
+            ancestor_context=ancestor_context or "",
         )
         
         result.code_generated = exec_result.get("code", "")
@@ -562,7 +630,13 @@ class RLMUnifiedExtractor:
             types = self._relationship_type_registry.get_types_for_prompt()
             if not types:
                 return ""
-            return f"\nAlso consider these learned types: {', '.join(types)}"
+            
+            logger.info(
+                "injecting_learned_relationship_types",
+                count=len(types),
+                types=types[:10],
+            )
+            return f"\nAlso consider these learned relationship types: {', '.join(types)}"
         except Exception:
             return ""
     
@@ -573,6 +647,7 @@ class RLMUnifiedExtractor:
         document_text: str,
         learned_entity_types: str,
         learned_relationship_types: str,
+        ancestor_context: str = "",
     ) -> dict[str, Any]:
         """Generate extraction code and execute it."""
         llm = self._get_llm()
@@ -607,6 +682,7 @@ class RLMUnifiedExtractor:
             header=header,
             content_preview=content[:3000],
             content_length=len(content),
+            ancestor_context=ancestor_context,
         )
         
         prompt = f"{system_prompt}\n\n{extraction_prompt}"
@@ -905,12 +981,68 @@ class RLMUnifiedExtractor:
         
         return entities, relationships
     
+    # Fuzzy-match table for auto-suggesting mappings of learned relationship types
+    _LEARNED_REL_KEYWORDS: dict[str, str] = {
+        "employ": "employed_at",
+        "work": "employed_at",
+        "hire": "employed_at",
+        "job": "employed_at",
+        "born": "born_in",
+        "birth": "born_in",
+        "spouse": "spouse_of",
+        "married": "spouse_of",
+        "husband": "spouse_of",
+        "wife": "spouse_of",
+        "child": "child_of",
+        "parent": "child_of",
+        "son": "child_of",
+        "daughter": "child_of",
+        "sibling": "sibling_of",
+        "brother": "sibling_of",
+        "sister": "sibling_of",
+        "belong": "belongs_to",
+        "own": "belongs_to",
+        "holder": "belongs_to",
+        "issue": "issued_by",
+        "grant": "issued_by",
+        "certif": "issued_by",
+        "locat": "located_in",
+        "address": "located_in",
+        "resid": "located_in",
+        "live": "located_in",
+        "contact": "has_contact",
+        "phone": "has_contact",
+        "email": "has_contact",
+        "mobile": "has_contact",
+        "qualif": "has_qualification",
+        "degree": "has_qualification",
+        "educat": "has_qualification",
+        "stud": "has_qualification",
+        "affil": "affiliated_with",
+        "citizen": "affiliated_with",
+        "national": "affiliated_with",
+        "member": "affiliated_with",
+        "date": "has_date",
+        "expir": "has_date",
+        "refer": "references",
+        "mention": "mentions",
+        "cause": "causal",
+        "before": "temporal_before",
+        "after": "temporal_after",
+        "party": "party_to",
+    }
+
     def _learn_new_types(
         self,
         entities: list[Entity],
         relationships: list[Relationship],
     ) -> None:
-        """Learn new entity and relationship types."""
+        """Learn new entity and relationship types.
+        
+        For relationship types that fall through to OTHER, we also try to
+        auto-suggest a canonical mapping based on keyword matching so that
+        future documents benefit without waiting for manual curation.
+        """
         # Learn entity types
         if self._entity_type_registry:
             for entity in entities:
@@ -934,8 +1066,34 @@ class RLMUnifiedExtractor:
                             context=rel.evidence,
                             relationship_description=f"{rel.source_id} -> {rel.target_id}",
                         )
+                        
+                        # Auto-suggest a canonical mapping via keyword matching
+                        self._auto_suggest_relationship_mapping(original_type)
                     except Exception:
                         pass
+
+    def _auto_suggest_relationship_mapping(self, type_name: str) -> None:
+        """Try to auto-map a learned relationship type to a canonical RelationType."""
+        if not self._relationship_type_registry:
+            return
+        
+        # Skip if already has a mapping
+        existing = self._relationship_type_registry.get_mappings()
+        if type_name.lower() in existing:
+            return
+        
+        # Check if any keyword in the type_name matches a canonical type
+        lower = type_name.lower().replace("_", " ")
+        for keyword, canonical in self._LEARNED_REL_KEYWORDS.items():
+            if keyword in lower:
+                self._relationship_type_registry.suggest_mapping(type_name, canonical)
+                logger.info(
+                    "auto_mapped_learned_relationship_type",
+                    learned_type=type_name,
+                    mapped_to=canonical,
+                    matched_keyword=keyword,
+                )
+                return
     
     def _map_entity_type(self, type_str: str) -> EntityType:
         """Map type string to EntityType enum."""
@@ -963,11 +1121,14 @@ class RLMUnifiedExtractor:
             return mapping.get(type_str, EntityType.OTHER)
     
     def _map_relationship_type(self, type_str: str) -> RelationType:
-        """Map type string to RelationType enum."""
-        type_str = type_str.upper()
+        """Map type string to RelationType enum, including common aliases."""
+        type_str = type_str.upper().strip()
         
+        # Canonical mapping (exact match on upper-cased key)
         mapping = {
+            # Core types
             "MENTIONS": RelationType.MENTIONS,
+            "DEFINED_IN": RelationType.DEFINED_IN,
             "TEMPORAL_BEFORE": RelationType.TEMPORAL_BEFORE,
             "TEMPORAL_AFTER": RelationType.TEMPORAL_AFTER,
             "CAUSAL": RelationType.CAUSAL,
@@ -978,12 +1139,85 @@ class RLMUnifiedExtractor:
             "REFERENCES": RelationType.REFERENCES,
             "SUPERSEDES": RelationType.SUPERSEDES,
             "AMENDS": RelationType.AMENDS,
+            # New semantic types
+            "BELONGS_TO": RelationType.BELONGS_TO,
+            "EMPLOYED_AT": RelationType.EMPLOYED_AT,
+            "BORN_IN": RelationType.BORN_IN,
+            "SPOUSE_OF": RelationType.SPOUSE_OF,
+            "CHILD_OF": RelationType.CHILD_OF,
+            "SIBLING_OF": RelationType.SIBLING_OF,
+            "ISSUED_BY": RelationType.ISSUED_BY,
+            "HAS_QUALIFICATION": RelationType.HAS_QUALIFICATION,
+            "LOCATED_IN": RelationType.LOCATED_IN,
+            "HAS_CONTACT": RelationType.HAS_CONTACT,
+            "HAS_DATE": RelationType.HAS_DATE,
+            # Common aliases the LLM may produce
+            "WORKS_AT": RelationType.EMPLOYED_AT,
+            "EMPLOYED_BY": RelationType.EMPLOYED_AT,
+            "WORKS_FOR": RelationType.EMPLOYED_AT,
+            "EMPLOYEE_OF": RelationType.EMPLOYED_AT,
+            "WORKED_AT": RelationType.EMPLOYED_AT,
+            "BORN_AT": RelationType.BORN_IN,
+            "PLACE_OF_BIRTH": RelationType.BORN_IN,
+            "MARRIED_TO": RelationType.SPOUSE_OF,
+            "SPOUSE": RelationType.SPOUSE_OF,
+            "PARENT_OF": RelationType.CHILD_OF,    # reversed at call site if needed
+            "SON_OF": RelationType.CHILD_OF,
+            "DAUGHTER_OF": RelationType.CHILD_OF,
+            "BROTHER_OF": RelationType.SIBLING_OF,
+            "SISTER_OF": RelationType.SIBLING_OF,
+            "OWNS": RelationType.BELONGS_TO,
+            "OWNED_BY": RelationType.BELONGS_TO,
+            "HOLDER_OF": RelationType.BELONGS_TO,
+            "ISSUED_TO": RelationType.BELONGS_TO,
+            "HAS_DOCUMENT": RelationType.BELONGS_TO,
+            "LOCATED_AT": RelationType.LOCATED_IN,
+            "LIVES_IN": RelationType.LOCATED_IN,
+            "RESIDES_IN": RelationType.LOCATED_IN,
+            "ADDRESS": RelationType.LOCATED_IN,
+            "HAS_ADDRESS": RelationType.LOCATED_IN,
+            "HAS_EMAIL": RelationType.HAS_CONTACT,
+            "HAS_PHONE": RelationType.HAS_CONTACT,
+            "CONTACT": RelationType.HAS_CONTACT,
+            "HAS_CONTACT_DETAIL": RelationType.HAS_CONTACT,
+            "EDUCATED_AT": RelationType.HAS_QUALIFICATION,
+            "STUDIED_AT": RelationType.HAS_QUALIFICATION,
+            "DEGREE": RelationType.HAS_QUALIFICATION,
+            "HAS_DEGREE": RelationType.HAS_QUALIFICATION,
+            "QUALIFICATION": RelationType.HAS_QUALIFICATION,
+            "CERTIFIED_BY": RelationType.ISSUED_BY,
+            "GRANTED_BY": RelationType.ISSUED_BY,
+            "CITIZEN_OF": RelationType.AFFILIATED_WITH,
+            "CITIZENSHIP": RelationType.AFFILIATED_WITH,
+            "NATIONALITY": RelationType.AFFILIATED_WITH,
+            "MEMBER_OF": RelationType.AFFILIATED_WITH,
+            "HAS_DATE_OF_BIRTH": RelationType.BORN_IN,
+            "DATE_OF_BIRTH": RelationType.HAS_DATE,
+            "EXPIRY_DATE": RelationType.HAS_DATE,
+            "ISSUE_DATE": RelationType.HAS_DATE,
+            "START_DATE": RelationType.HAS_DATE,
+            "END_DATE": RelationType.HAS_DATE,
         }
         
         try:
             return RelationType(type_str.lower())
         except ValueError:
-            return mapping.get(type_str, RelationType.OTHER)
+            pass
+        
+        if type_str in mapping:
+            return mapping[type_str]
+        
+        # Check learned relationship type mappings from the registry
+        if self._relationship_type_registry:
+            learned_mappings = self._relationship_type_registry.get_mappings()
+            mapped_value = learned_mappings.get(type_str.lower())
+            if mapped_value:
+                try:
+                    return RelationType(mapped_value)
+                except ValueError:
+                    pass
+        
+        return RelationType.OTHER
     
     def to_extraction_result(self, unified_result: RLMUnifiedResult) -> ExtractionResult:
         """Convert to standard ExtractionResult format."""
@@ -1005,12 +1239,17 @@ def extract_entities_and_relationships(
     header: str,
     content: str,
     page_num: int | None = None,
+    ancestor_context: str | None = None,
 ) -> RLMUnifiedResult:
     """
     Extract entities and relationships using the unified RLM approach.
     
     This is the recommended way to extract - always uses the most
     accurate, grounded approach with ToT validation.
+    
+    Args:
+        ancestor_context: Hierarchical breadcrumb and subject hint so
+            the LLM knows *who/what* the section is about.
     """
     extractor = RLMUnifiedExtractor()
     return extractor.extract(
@@ -1019,4 +1258,5 @@ def extract_entities_and_relationships(
         header=header,
         content=content,
         page_num=page_num,
+        ancestor_context=ancestor_context,
     )
