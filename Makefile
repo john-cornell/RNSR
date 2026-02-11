@@ -9,7 +9,7 @@ else
     PYTHON := $(VENV)/bin/python
 endif
 
-.PHONY: help demo test test-fast test-cov lint format install clean venv
+.PHONY: help demo test test-fast test-cov lint format install clean venv update
 
 # Default target
 help:
@@ -30,6 +30,7 @@ help:
 	@echo "  test-cov      Run tests with coverage report"
 	@echo ""
 	@echo "Development:"
+	@echo "  update        Pull the latest version from git"
 	@echo "  lint          Run linter (ruff)"
 	@echo "  format        Format code (ruff)"
 	@echo "  venv          Create virtual environment"
@@ -184,6 +185,12 @@ publish:
 publish-test:
 	@echo "📤 Publishing to TestPyPI..."
 	twine upload --repository testpypi dist/*
+
+# Pull the latest version from git
+update:
+	@echo "⬇️  Pulling latest changes..."
+	git pull
+	@echo "✅ Up to date."
 
 # Check if environment is set up correctly
 check-env:

@@ -14,6 +14,7 @@ from __future__ import annotations  # Enable Python 3.10+ type hints on Python 3
 import os
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -499,6 +500,15 @@ def get_entities_visualization() -> str:
     return "\n".join(lines)
 
 
+def _rel_label(rel) -> str:
+    """Return a human-readable relationship label, preferring the original LLM type."""
+    # If the LLM assigned a custom type that mapped to OTHER, use the original
+    original = (rel.metadata or {}).get("original_type", "")
+    if original and rel.type.value == "other":
+        return original.replace("_", " ").title()
+    return rel.type.value.replace("_", " ").title()
+
+
 def get_relationships_visualization() -> str:
     if not state.knowledge_graph or not state.entities:
         if state.document_path:
@@ -513,22 +523,63 @@ def get_relationships_visualization() -> str:
     if rel_count == 0:
         return "No relationships found in this document."
 
-    lines = [f"## Entity Relationships ({rel_count} total)\n"]
-    shown = 0
-    for entity in state.entities[:15]:
-        rels = state.knowledge_graph.get_entity_relationships(entity.id)
-        for rel in rels[:3]:
+    # Build an entity-id → name lookup
+    entity_name: dict[str, str] = {}
+    for ent in state.entities:
+        entity_name[ent.id] = ent.canonical_name
+
+    # Collect ALL relationships, grouped by source entity
+    grouped: dict[str, list] = defaultdict(list)   # source_name -> [(label, target_name, evidence)]
+    seen_ids: set[str] = set()
+
+    for entity in state.entities:
+        rels = state.knowledge_graph.get_entity_relationships(entity.id, direction="outgoing")
+        for rel in rels:
+            if rel.id in seen_ids:
+                continue
+            seen_ids.add(rel.id)
+
+            source_name = entity_name.get(rel.source_id, rel.source_id)
             target = state.knowledge_graph.get_entity(rel.target_id)
-            target_name = target.canonical_name if target else rel.target_id
-            rel_type = rel.type.value.replace("_", " ").title()
-            lines.append(f"- {entity.canonical_name} → **{rel_type}** → {target_name}")
-            shown += 1
-            if shown >= 30:
-                break
-        if shown >= 30:
-            break
-    if shown == 0:
+            target_name = target.canonical_name if target else entity_name.get(rel.target_id, rel.target_id)
+            label = _rel_label(rel)
+            evidence = (rel.evidence or "").strip()
+            grouped[source_name].append((label, target_name, evidence))
+
+    # Also pick up any relationships whose source wasn't in our outgoing sweep
+    for entity in state.entities:
+        rels = state.knowledge_graph.get_entity_relationships(entity.id, direction="incoming")
+        for rel in rels:
+            if rel.id in seen_ids:
+                continue
+            seen_ids.add(rel.id)
+
+            source_name = entity_name.get(rel.source_id, rel.source_id)
+            target = state.knowledge_graph.get_entity(rel.target_id)
+            target_name = target.canonical_name if target else entity_name.get(rel.target_id, rel.target_id)
+            label = _rel_label(rel)
+            evidence = (rel.evidence or "").strip()
+            grouped[source_name].append((label, target_name, evidence))
+
+    lines = [f"## Entity Relationships ({rel_count} total — {len(seen_ids)} shown)\n"]
+
+    if not grouped:
         lines.append("*(No entity-to-entity relationships found)*")
+        return "\n".join(lines)
+
+    # Sort groups: entities with most relationships first
+    for source_name, rels_list in sorted(grouped.items(), key=lambda x: -len(x[1])):
+        lines.append(f"\n### {source_name} ({len(rels_list)} rel{'s' if len(rels_list) != 1 else ''})\n")
+        for label, target_name, evidence in rels_list:
+            line = f"- **{label}** → {target_name}"
+            if evidence:
+                # Show a short snippet of evidence for context
+                snippet = evidence[:120].replace("\n", " ")
+                if len(evidence) > 120:
+                    snippet += "…"
+                line += f"  \n  *\"{snippet}\"*"
+            lines.append(line)
+
     return "\n".join(lines)
 
 
