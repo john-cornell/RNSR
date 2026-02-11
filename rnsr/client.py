@@ -442,11 +442,13 @@ class RNSRClient:
 
         entity_count = 0
         relationship_count = 0
+        nodes_done = 0
+        total_nodes = len(work_items)
 
         logger.info(
             "knowledge_graph_extraction_started",
             cache_key=cache_key,
-            node_count=len(work_items),
+            node_count=total_nodes,
             max_workers=max_workers,
         )
 
@@ -458,21 +460,27 @@ class RNSRClient:
 
             for future in as_completed(future_to_node):
                 node_id = future_to_node[future]
+                nodes_done += 1
                 try:
                     result = future.result()
                 except Exception as exc:
                     logger.warning(
                         "extraction_failed_for_node",
                         node_id=node_id,
+                        progress=f"{nodes_done}/{total_nodes}",
                         error=str(exc),
                     )
                     continue
+
+                node_entities_added = 0
+                node_rels_added = 0
 
                 # Add entities (already proper Entity objects)
                 for entity in result.entities:
                     try:
                         kg.add_entity(entity)
                         entity_count += 1
+                        node_entities_added += 1
                     except Exception as ent_err:
                         logger.warning(
                             "add_entity_failed",
@@ -486,6 +494,7 @@ class RNSRClient:
                     try:
                         kg.add_relationship(relationship)
                         relationship_count += 1
+                        node_rels_added += 1
                     except Exception as rel_err:
                         logger.warning(
                             "add_relationship_failed",
@@ -493,12 +502,28 @@ class RNSRClient:
                             error=str(rel_err),
                         )
 
+                # Per-node summary with entity names for easy monitoring
+                entity_names = [e.canonical_name for e in result.entities]
+                header = skeleton.get(node_id)
+                header_text = header.header if header else node_id
+                logger.info(
+                    "node_extraction_complete",
+                    progress=f"{nodes_done}/{total_nodes}",
+                    node_id=node_id,
+                    header=header_text[:60],
+                    entities_added=node_entities_added,
+                    relationships_added=node_rels_added,
+                    entity_names=entity_names,
+                    running_total_entities=entity_count,
+                    running_total_relationships=relationship_count,
+                )
+
         logger.info(
             "knowledge_graph_created",
             cache_key=cache_key,
             entity_count=entity_count,
             relationship_count=relationship_count,
-            node_count=len(skeleton),
+            node_count=total_nodes,
         )
 
         # Cache the knowledge graph
