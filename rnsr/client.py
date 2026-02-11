@@ -147,31 +147,37 @@ class RNSRClient:
         self,
         document: str | Path,
         question: str,
+        use_knowledge_graph: bool = True,
         force_reindex: bool = False,
     ) -> dict[str, Any]:
         """
         Ask a question about a PDF document.
         
+        By default, a knowledge graph is built (or reused from cache) to give
+        the navigator entity awareness, which significantly improves accuracy.
+        Set ``use_knowledge_graph=False`` to skip this step for faster but
+        less accurate results.
+        
         Args:
             document: Path to PDF file
             question: Question to ask
+            use_knowledge_graph: Build and use knowledge graph with entity
+                                 extraction (default True).
             force_reindex: If True, re-process even if cached
             
         Returns:
-            Result dictionary from the navigator
+            Answer string from the navigator
             
         Example:
             answer = client.ask("contract.pdf", "What are the payment terms?")
         """
-        doc_path = Path(document)
-        if not doc_path.exists():
-            raise FileNotFoundError(f"Document not found: {doc_path}")
-        
-        # Get or create index
-        skeleton, kv_store = self._get_or_create_index(doc_path, force_reindex)
-        
-        # Run navigator
-        result = run_navigator(question, skeleton, kv_store)
+        # Delegate to ask_advanced which supports knowledge graph via RLMNavigator
+        result = self.ask_advanced(
+            document=document,
+            question=question,
+            use_knowledge_graph=use_knowledge_graph,
+            force_reindex=force_reindex,
+        )
         return result.get("answer", "No answer found.")
     
     def ask_text(
@@ -375,144 +381,120 @@ class RNSRClient:
     # =========================================================================
     # Knowledge Graph Support
     # =========================================================================
-    
-    def _extract_entities(self, text: str, header: str) -> list[dict]:
-        """
-        Extract named entities from text using regex patterns.
-        
-        This replicates the entity extraction from the benchmark that
-        contributes to zero-hallucination performance.
-        
-        Args:
-            text: The text content to extract entities from.
-            header: The section header for context.
-            
-        Returns:
-            List of entity dictionaries with name and type.
-        """
-        entities = []
-        
-        # Pattern for company names (Inc., LLC, Corp., Ltd., etc.)
-        company_pattern = r'([A-Z][A-Za-z\s]+(?:Inc\.|LLC|Corp\.|Ltd\.|Corporation|Company|Pty Ltd|Limited))'
-        for match in re.finditer(company_pattern, text):
-            entities.append({
-                "name": match.group(1).strip(),
-                "type": "ORGANIZATION",
-            })
-        
-        # Pattern for roles in quotes (e.g., "Client", "Provider")
-        role_pattern = r'"([A-Z][A-Za-z]+)"'
-        for match in re.finditer(role_pattern, text):
-            role = match.group(1)
-            if role in ["Client", "Provider", "Contractor", "Vendor", "Customer", 
-                       "Employer", "Employee", "Worker", "Claimant", "Applicant",
-                       "Respondent", "Defendant", "Plaintiff"]:
-                entities.append({
-                    "name": role,
-                    "type": "ROLE",
-                })
-        
-        # Pattern for monetary values
-        money_pattern = r'\$[\d,]+(?:\.\d{2})?(?:\s*(?:USD|AUD|dollars?))?'
-        for match in re.finditer(money_pattern, text, re.IGNORECASE):
-            entities.append({
-                "name": match.group(0),
-                "type": "MONEY",
-            })
-        
-        # Pattern for dates (various formats)
-        date_patterns = [
-            r'(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}',
-            r'\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}',
-            r'\d{1,2}/\d{1,2}/\d{4}',
-            r'\d{4}-\d{2}-\d{2}',
-        ]
-        for pattern in date_patterns:
-            for match in re.finditer(pattern, text):
-                entities.append({
-                    "name": match.group(0),
-                    "type": "DATE",
-                })
-        
-        # Pattern for section references (Section X, Part Y, etc.)
-        section_pattern = r'(?:Section|Part|Clause|Article|Schedule)\s+\d+(?:\.\d+)*(?:\([a-z]\))?'
-        for match in re.finditer(section_pattern, text, re.IGNORECASE):
-            entities.append({
-                "name": match.group(0),
-                "type": "REFERENCE",
-            })
-        
-        # Pattern for person names (basic: Title + Name)
-        person_pattern = r'(?:Mr\.?|Mrs\.?|Ms\.?|Dr\.?|Hon\.?)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+'
-        for match in re.finditer(person_pattern, text):
-            entities.append({
-                "name": match.group(0).strip(),
-                "type": "PERSON",
-            })
-        
-        return entities
-    
+
     def _get_or_create_knowledge_graph(
         self,
         cache_key: str,
         skeleton: dict[str, SkeletonNode],
         kv_store: KVStore,
         doc_id: str = "document",
+        max_workers: int | None = None,
     ) -> KnowledgeGraph:
         """
         Get cached knowledge graph or create a new one with extracted entities.
         
-        This is key to matching benchmark performance - the knowledge graph
-        helps the navigator understand entity relationships.
+        Uses the RLMUnifiedExtractor to extract entities and relationships
+        from each skeleton node **in parallel**.  The extractor is LLM-driven
+        and adaptive: it discovers entity/relationship types from the document
+        content and persists learned types to ``~/.rnsr/`` for future runs.
         
         Args:
             cache_key: Cache key for the document.
             skeleton: The skeleton index.
             kv_store: The key-value store with content.
             doc_id: Document identifier.
+            max_workers: Max parallel extraction threads.  Defaults to
+                         ``min(8, node_count)`` which is a good balance
+                         between speed and LLM API rate-limits.
             
         Returns:
-            KnowledgeGraph with extracted entities.
+            KnowledgeGraph with extracted entities and relationships.
         """
         # Check cache first
         if cache_key in self._kg_cache:
             logger.debug("using_cached_knowledge_graph", key=cache_key)
             return self._kg_cache[cache_key]
-        
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from rnsr.extraction import extract_entities_and_relationships
+
         # Create new knowledge graph (in-memory for now)
         kg = KnowledgeGraph(":memory:")
-        
-        # Extract entities from each node
+
+        # Prepare work items: (node_id, header, content)
+        work_items = [
+            (node_id, node.header, kv_store.get(node_id) or "")
+            for node_id, node in skeleton.items()
+        ]
+
+        if max_workers is None:
+            max_workers = min(8, len(work_items)) or 1
+
+        def _extract_node(item):
+            """Run extraction for a single node (executed in worker thread)."""
+            node_id, header, content = item
+            return extract_entities_and_relationships(
+                node_id=node_id,
+                doc_id=doc_id,
+                header=header,
+                content=content,
+            )
+
         entity_count = 0
-        for node_id, node in skeleton.items():
-            content = kv_store.get(node_id) or ""
-            full_text = f"{node.header}\n{content}"
-            
-            entities = self._extract_entities(full_text, node.header)
-            
-            for entity in entities:
+        relationship_count = 0
+
+        logger.info(
+            "knowledge_graph_extraction_started",
+            cache_key=cache_key,
+            node_count=len(work_items),
+            max_workers=max_workers,
+        )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_node = {
+                pool.submit(_extract_node, item): item[0]
+                for item in work_items
+            }
+
+            for future in as_completed(future_to_node):
+                node_id = future_to_node[future]
                 try:
-                    kg.add_entity(
-                        name=entity["name"],
-                        entity_type=entity["type"],
-                        doc_id=doc_id,
+                    result = future.result()
+                except Exception as exc:
+                    logger.warning(
+                        "extraction_failed_for_node",
                         node_id=node_id,
-                        properties={"header": node.header},
+                        error=str(exc),
                     )
-                    entity_count += 1
-                except Exception:
-                    pass  # Skip duplicates or errors
-        
+                    continue
+
+                # Add entities (already proper Entity objects)
+                for entity in result.entities:
+                    try:
+                        kg.add_entity(entity)
+                        entity_count += 1
+                    except Exception:
+                        pass  # Skip duplicates or errors
+
+                # Add relationships (already proper Relationship objects)
+                for relationship in result.relationships:
+                    try:
+                        kg.add_relationship(relationship)
+                        relationship_count += 1
+                    except Exception:
+                        pass
+
         logger.info(
             "knowledge_graph_created",
             cache_key=cache_key,
             entity_count=entity_count,
+            relationship_count=relationship_count,
             node_count=len(skeleton),
         )
-        
+
         # Cache the knowledge graph
         self._kg_cache[cache_key] = kg
-        
+
         return kg
     
     # =========================================================================

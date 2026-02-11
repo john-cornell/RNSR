@@ -383,9 +383,41 @@ class RLMUnifiedExtractor:
                 self._relationship_type_registry = None
     
     def _get_llm(self) -> Any:
-        """Get or initialize LLM."""
+        """Get or initialize LLM.
+        
+        Checks the ``RNSR_EXTRACTION_MODEL`` environment variable first.
+        This lets you pin a small, fast model (e.g. ``gemini-2.5-flash``,
+        ``gpt-5-mini``) for entity extraction while keeping a larger model
+        for navigation / answer synthesis.
+        """
         if self.llm is None and not self._llm_initialized:
-            self.llm = get_llm()
+            import os
+            from rnsr.llm import LLMProvider
+
+            extraction_model = os.getenv("RNSR_EXTRACTION_MODEL")
+            extraction_provider_str = os.getenv("RNSR_EXTRACTION_PROVIDER")
+
+            kwargs: dict[str, Any] = {}
+            if extraction_model:
+                kwargs["model"] = extraction_model
+            if extraction_provider_str:
+                try:
+                    kwargs["provider"] = LLMProvider(extraction_provider_str.lower())
+                except ValueError:
+                    logger.warning(
+                        "invalid_extraction_provider",
+                        value=extraction_provider_str,
+                        valid=list(LLMProvider),
+                    )
+
+            if kwargs:
+                logger.info(
+                    "extraction_llm_override",
+                    **kwargs,
+                )
+                self.llm = get_llm(**kwargs)
+            else:
+                self.llm = get_llm()
             self._llm_initialized = True
         return self.llm
     

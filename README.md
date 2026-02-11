@@ -105,7 +105,7 @@ RNSR combines neural and symbolic approaches to achieve accurate document unders
 | **🏆 100% FinanceBench** | Only retrieval system to achieve perfect accuracy on the industry benchmark |
 | **Zero Hallucinations** | Grounded answers with provenance - if not found, says so |
 | **Hierarchical Extraction** | Preserves document structure (sections, subsections, paragraphs) |
-| **Knowledge Graph** | Entity extraction (companies, people, dates, amounts) with relationship tracking |
+| **Knowledge Graph** | LLM-driven entity & relationship extraction with adaptive type learning and parallel processing |
 | **RLM Navigation** | LLM writes code to navigate documents - deterministic and reproducible |
 | **SQL-like Table Queries** | `SELECT`, `WHERE`, `ORDER BY`, `SUM`, `AVG` over detected tables |
 | **Provenance System** | Every answer traces back to exact document citations |
@@ -176,6 +176,10 @@ GOOGLE_API_KEY=AI...
 # Optional: Override default models
 LLM_PROVIDER=anthropic
 SUMMARY_MODEL=claude-sonnet-4-5
+
+# Optional: Use a fast, cheap model for entity extraction
+RNSR_EXTRACTION_MODEL=gemini-2.5-flash
+# RNSR_EXTRACTION_PROVIDER=gemini  # if different from your primary provider
 ```
 
 ### 2. Use the Python API
@@ -215,15 +219,13 @@ The RNSR benchmark (`make benchmark-compare`) achieves zero hallucinations and h
 
 The benchmark uses three key components that work together:
 
-1. **Knowledge Graph with Entity Extraction** - Automatically extracts and indexes:
-   - Organization names (companies, firms)
-   - Person names and roles
-   - Monetary values and dates
-   - Section/clause references
+1. **Knowledge Graph with LLM-Driven Entity Extraction** - Uses the `RLMUnifiedExtractor` to discover entities and relationships directly from the text. The extractor is adaptive -- it learns new entity types from your documents and persists them to `~/.rnsr/learned_entity_types.json`. No hardcoded patterns; the LLM writes extraction code grounded in the actual document content.
    
-2. **Cached LLM Instance** - Reuses a single LLM instance across queries for consistency and reduced latency
+2. **Parallel Extraction** - Entity extraction runs across skeleton nodes in parallel using a thread pool (default 8 workers), reducing wall-clock time by up to 8x for large documents.
 
-3. **RLMNavigator with Entity Awareness** - The navigator can query the knowledge graph to understand relationships between entities in the document
+3. **Cached LLM Instance** - Reuses a single LLM instance across queries for consistency and reduced latency
+
+4. **RLMNavigator with Entity Awareness** - The navigator can query the knowledge graph to understand relationships between entities in the document
 
 ### Replicating in Your Application
 
@@ -292,7 +294,7 @@ result = navigator.navigate("What is the contract value?")
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `use_rlm` | `True` | Use RLM Navigator (vs. simpler navigator) |
-| `use_knowledge_graph` | `True` | Extract entities and build knowledge graph |
+| `use_knowledge_graph` | `True` | Extract entities/relationships in parallel and build knowledge graph |
 | `enable_pre_filtering` | `True` | Filter nodes by keywords before LLM calls |
 | `enable_verification` | `False` | Enable strict critic loop (can reject valid answers) |
 | `max_recursion_depth` | `3` | Maximum depth for recursive sub-LLM calls |
@@ -303,6 +305,7 @@ result = navigator.navigate("What is the contract value?")
 2. **Keep `use_knowledge_graph=True`** - This is key to benchmark-level accuracy
 3. **Set `enable_verification=False`** for most cases - The critic can be too aggressive
 4. **Reuse the same client instance** - The navigator and knowledge graph are cached
+5. **Parallel extraction is automatic** - Knowledge graph building runs up to 8 extraction threads in parallel. Tune `max_workers` on the `_get_or_create_knowledge_graph` call if you hit API rate limits
 
 ## New Features
 
@@ -476,14 +479,18 @@ Question → Clarify → Pre-Filter → Tree Navigation → Answer → Self-Refl
                                   (complex queries)        (if issues)
 ```
 
-### Entity Extraction (RLM Unified)
+### Entity Extraction (RLM Unified, Parallel)
 
 ```
-Document → LLM writes code → Execute on DOC_VAR → ToT validation → Cross-validate
-              ↓                     ↓                   ↓               ↓
-     Generates regex/Python   Grounded results   Probability scores  Entity↔Relationship
-                                    ↓
-                            All tied to exact text spans
+Document → Split into nodes → ThreadPool (8 workers) → Merge results → Knowledge Graph
+                                     ↓ (per node)
+                              LLM writes code → Execute on DOC_VAR → ToT validation
+                                    ↓                   ↓                   ↓
+                             Generates Python     Grounded results   Probability scores
+                                                        ↓
+                                                All tied to exact text spans
+                                                        ↓
+                                              Learned types persisted to ~/.rnsr/
 ```
 
 ### RLM Navigation Architecture (ToT + REPL Integration)
@@ -655,6 +662,8 @@ record = tracker.create_provenance_record(answer, question, variables)
 | `EMBEDDING_MODEL` | Embedding model | `text-embedding-3-small` |
 | `KV_STORE_PATH` | SQLite database path | `./data/kv_store.db` |
 | `LOG_LEVEL` | Logging verbosity | `INFO` |
+| `RNSR_EXTRACTION_MODEL` | Model for entity extraction (e.g. `gemini-2.5-flash`) | Same as primary LLM |
+| `RNSR_EXTRACTION_PROVIDER` | Provider for entity extraction (`openai`, `anthropic`, `gemini`) | Same as primary provider |
 | `RNSR_LLM_CACHE_PATH` | Custom cache location | `~/.rnsr/llm_cache.db` |
 | `RNSR_REASONING_MEMORY_PATH` | Custom memory location | `~/.rnsr/reasoning_chains.json` |
 
