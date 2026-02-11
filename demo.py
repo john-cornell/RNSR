@@ -521,7 +521,8 @@ Tables are automatically detected during document processing. This document may 
             if len(table["headers"]) > 5:
                 headers_str += f" ... (+{len(table['headers']) - 5} more)"
             
-            lines.append(f"### {i}. {table.get('title') or f'Table {table['id']}'}")
+            table_label = table.get('title') or f"Table {table['id']}"
+            lines.append(f"### {i}. {table_label}")
             lines.append(f"- **ID:** `{table['id']}`")
             lines.append(f"- **Rows:** {table['num_rows']} | **Columns:** {table['num_cols']}")
             lines.append(f"- **Headers:** {headers_str}")
