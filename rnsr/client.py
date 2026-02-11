@@ -473,16 +473,25 @@ class RNSRClient:
                     try:
                         kg.add_entity(entity)
                         entity_count += 1
-                    except Exception:
-                        pass  # Skip duplicates or errors
+                    except Exception as ent_err:
+                        logger.warning(
+                            "add_entity_failed",
+                            entity_id=getattr(entity, "id", "?"),
+                            entity_name=getattr(entity, "canonical_name", "?"),
+                            error=str(ent_err),
+                        )
 
                 # Add relationships (already proper Relationship objects)
                 for relationship in result.relationships:
                     try:
                         kg.add_relationship(relationship)
                         relationship_count += 1
-                    except Exception:
-                        pass
+                    except Exception as rel_err:
+                        logger.warning(
+                            "add_relationship_failed",
+                            rel_id=getattr(relationship, "id", "?"),
+                            error=str(rel_err),
+                        )
 
         logger.info(
             "knowledge_graph_created",
