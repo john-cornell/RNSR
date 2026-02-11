@@ -343,12 +343,20 @@ class RNSRClient:
         if not force_reindex and self.cache_dir:
             cache_path = self.cache_dir / cache_key
             if cache_path.exists():
-                logger.debug("using_persistent_cache", key=cache_key)
-                skeleton, kv_store, tables = load_index(cache_path)
-                self._session_cache[cache_key] = (skeleton, kv_store)
-                if tables:
-                    self._tables_cache[cache_key] = tables
-                return skeleton, kv_store
+                try:
+                    logger.debug("using_persistent_cache", key=cache_key)
+                    skeleton, kv_store, tables = load_index(cache_path)
+                    self._session_cache[cache_key] = (skeleton, kv_store)
+                    if tables:
+                        self._tables_cache[cache_key] = tables
+                    return skeleton, kv_store
+                except Exception as exc:
+                    logger.warning(
+                        "cache_load_failed",
+                        key=cache_key,
+                        error=str(exc),
+                    )
+                    # Fall through to re-index from scratch
         
         # Create new index
         logger.info("creating_new_index", path=str(doc_path))
@@ -417,6 +425,10 @@ class RNSRClient:
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from rnsr.extraction import extract_entities_and_relationships
+        from rnsr.extraction import RLMUnifiedResult
+        from rnsr.extraction.rlm_unified_extractor import (
+            extract_entities_and_relationships_batch,
+        )
 
         # Create new knowledge graph (in-memory for now)
         kg = KnowledgeGraph(":memory:")
@@ -433,8 +445,58 @@ class RNSRClient:
         # This lets the LLM know that "Identity Documents" belongs to the
         # primary applicant (GeoV William Sorenssen), not to a nameless entity.
         # -----------------------------------------------------------------
+        def _find_personal_info_content(container_id: str) -> str:
+            """Drill into a container section to find Personal Information.
+            
+            Given a section like "PRIMARY APPLICANT DETAILS" that has children
+            (Personal Information, Contact Details, Identity Documents), find
+            the child that contains the person's name / identity details.
+            """
+            container = skeleton.get(container_id)
+            if not container or not container.child_ids:
+                # Leaf node — return its own content
+                return (kv_store.get(container_id) or "")[:400]
+
+            # Look for a child with a header containing "personal", "info",
+            # or just take the first child with substantial content.
+            for child_id in container.child_ids:
+                child = skeleton.get(child_id)
+                if not child:
+                    continue
+                h_lower = child.header.lower()
+                if "personal" in h_lower or "info" in h_lower or "name" in h_lower:
+                    content = kv_store.get(child_id) or ""
+                    if len(content) > 50:
+                        return content[:400]
+
+            # Fallback: first child with enough content
+            for child_id in container.child_ids:
+                content = kv_store.get(child_id) or ""
+                if len(content) > 50:
+                    return content[:400]
+
+            return ""
+
         def _build_ancestor_context(node_id: str) -> str:
-            """Walk up the tree and build a breadcrumb + subject hint."""
+            """Walk up the tree and build a breadcrumb + subject hint.
+            
+            The subject hint resolves generic labels like "PRIMARY APPLICANT"
+            to actual names by finding the Personal Information section
+            under the relevant applicant container.
+            
+            For a document structured as:
+              Form 80 Data
+                PRIMARY APPLICANT DETAILS
+                  Personal Information  ← "GeoV William Sorenssen"
+                  Contact Details
+                  Identity Documents
+                EDUCATION HISTORY      ← sibling, needs subject hint
+                TRAVEL HISTORY         ← sibling, needs subject hint
+            
+            The subject hint for EDUCATION HISTORY finds the nearest
+            preceding applicant section (PRIMARY APPLICANT DETAILS), drills
+            into its "Personal Information" child, and extracts the name.
+            """
             parts: list[str] = []
             current = node_id
             while current:
@@ -446,31 +508,79 @@ class RNSRClient:
             parts.reverse()
             breadcrumb = " > ".join(parts)
 
-            # Try to find the "subject" — usually the first sibling leaf node
-            # (Personal Information) under the nearest parent that has a
-            # person-level header (e.g. PRIMARY APPLICANT DETAILS).
             subject_hint = ""
             node = skeleton.get(node_id)
             if node and node.parent_id:
                 parent = skeleton.get(node.parent_id)
                 if parent and parent.child_ids:
-                    # Look at the first child — it's usually "Personal Information"
+                    # Strategy 1: Direct sibling lookup (works when this node
+                    # is a child of e.g. "PRIMARY APPLICANT DETAILS")
                     first_child_id = parent.child_ids[0]
                     if first_child_id != node_id:
-                        first_content = kv_store.get(first_child_id) or ""
-                        # Extract a short subject snippet (first ~300 chars)
-                        if first_content:
-                            subject_hint = first_content[:300]
+                        first_child = skeleton.get(first_child_id)
+                        if first_child and first_child.child_ids:
+                            # First sibling is a container — drill into it
+                            subject_hint = _find_personal_info_content(first_child_id)
+                        else:
+                            content = kv_store.get(first_child_id) or ""
+                            if len(content) > 50:
+                                subject_hint = content[:400]
+
+                    # Strategy 2: If this is a top-level section (e.g.
+                    # EDUCATION HISTORY under Form 80 Data), find the
+                    # PRIMARY APPLICANT section and drill into it.
+                    # Also works for deeper nodes (e.g. "Current Employment"
+                    # under "EMPLOYMENT HISTORY") — we walk up through
+                    # grandparent siblings too.
+                    #
+                    # We prefer "primary applicant" over any other
+                    # applicant section, because forms like Form 80
+                    # list the secondary applicant for reference but all
+                    # subsequent sections are about the primary.
+                    if not subject_hint:
+                        search_node = node
+                        while not subject_hint and search_node and search_node.parent_id:
+                            search_parent = skeleton.get(search_node.parent_id)
+                            if not search_parent or not search_parent.child_ids:
+                                break
+
+                            # First pass: look for "primary applicant"
+                            # Second pass: any applicant/personal/client
+                            for keyword_set in [
+                                ("primary",),
+                                ("applicant", "personal", "client"),
+                            ]:
+                                if subject_hint:
+                                    break
+                                for sib_id in search_parent.child_ids:
+                                    if sib_id == node_id:
+                                        continue
+                                    sib = skeleton.get(sib_id)
+                                    if not sib:
+                                        continue
+                                    h_lower = sib.header.lower()
+                                    if any(kw in h_lower for kw in keyword_set):
+                                        subject_hint = _find_personal_info_content(sib_id)
+                                        if subject_hint:
+                                            break
+
+                            # Move up one level
+                            search_node = search_parent
 
             lines = [f"Document path: {breadcrumb}"]
             if subject_hint:
                 lines.append(
-                    f"Subject context (from sibling section): {subject_hint}"
+                    f"Subject of this section (from Personal Information):\n{subject_hint}"
                 )
             return "\n".join(lines)
 
         # Prepare work items: (node_id, header, content, ancestor_context)
-        work_items = [
+        # Skip nodes with very short content — these are container/header
+        # nodes (e.g. "PRIMARY APPLICANT DETAILS" with 25 chars) that have
+        # no extractable entities.  The extractor already skips <50 chars,
+        # but filtering here avoids scheduling overhead and LLM init.
+        MIN_CONTENT_LENGTH = 50
+        all_items = [
             (
                 node_id,
                 node.header,
@@ -479,19 +589,144 @@ class RNSRClient:
             )
             for node_id, node in skeleton.items()
         ]
+        work_items = [
+            item for item in all_items
+            if len(item[2].strip()) >= MIN_CONTENT_LENGTH
+        ]
+        skipped = len(all_items) - len(work_items)
+        if skipped:
+            logger.info(
+                "skipped_short_nodes",
+                skipped=skipped,
+                threshold=MIN_CONTENT_LENGTH,
+                total=len(all_items),
+                remaining=len(work_items),
+            )
 
+        import os
+        import json as _json
         if max_workers is None:
-            max_workers = min(8, len(work_items)) or 1
+            default_workers = int(os.getenv("RNSR_EXTRACTION_WORKERS", "16"))
+            max_workers = min(default_workers, len(work_items)) or 1
+
+        # Per-node extraction cache — allows resumption of interrupted runs
+        # and avoids re-extracting unchanged nodes.
+        from rnsr.extraction.models import Entity, Relationship
+
+        node_cache_dir: Path | None = None
+        if self.cache_dir:
+            node_cache_dir = self.cache_dir / cache_key / "nodes"
+            node_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        def _load_cached_result(node_id: str) -> RLMUnifiedResult | None:
+            """Try to load a cached extraction result for a node."""
+            if node_cache_dir is None:
+                return None
+            cache_file = node_cache_dir / f"{node_id}.json"
+            if not cache_file.exists():
+                return None
+            try:
+                data = _json.loads(cache_file.read_text())
+                entities = [Entity.model_validate(e) for e in data.get("entities", [])]
+                relationships = [Relationship.model_validate(r) for r in data.get("relationships", [])]
+                result = RLMUnifiedResult(
+                    node_id=node_id,
+                    doc_id=doc_id,
+                    entities=entities,
+                    relationships=relationships,
+                    code_executed=True,
+                )
+                return result
+            except Exception as exc:
+                logger.debug("node_cache_load_failed", node_id=node_id, error=str(exc))
+                return None
+
+        def _save_cached_result(node_id: str, result: RLMUnifiedResult) -> None:
+            """Save an extraction result to the per-node cache."""
+            if node_cache_dir is None:
+                return
+            try:
+                data = {
+                    "entities": [e.model_dump(mode="json") for e in result.entities],
+                    "relationships": [r.model_dump(mode="json") for r in result.relationships],
+                }
+                cache_file = node_cache_dir / f"{node_id}.json"
+                cache_file.write_text(_json.dumps(data, default=str))
+            except Exception as exc:
+                logger.debug("node_cache_save_failed", node_id=node_id, error=str(exc))
 
         def _extract_node(item):
             """Run extraction for a single node (executed in worker thread)."""
             node_id, header, content, ancestor_context = item
-            return extract_entities_and_relationships(
+            # Check per-node cache first
+            cached = _load_cached_result(node_id)
+            if cached is not None:
+                logger.debug("node_extraction_cached", node_id=node_id)
+                return cached
+            result = extract_entities_and_relationships(
                 node_id=node_id,
                 doc_id=doc_id,
                 header=header,
                 content=content,
                 ancestor_context=ancestor_context,
+            )
+            _save_cached_result(node_id, result)
+            return result
+
+        def _extract_batch(batch_items):
+            """Extract a batch of small nodes in a single LLM call."""
+            # Check cache for each item first
+            cached_results = []
+            uncached = []
+            for item in batch_items:
+                node_id = item[0]
+                cached = _load_cached_result(node_id)
+                if cached is not None:
+                    logger.debug("node_extraction_cached", node_id=node_id)
+                    cached_results.append(cached)
+                else:
+                    uncached.append(item)
+
+            if not uncached:
+                return cached_results
+
+            # Build batch input: (node_id, doc_id, header, content, ancestor_context)
+            batch_input = [
+                (nid, doc_id, hdr, cnt, ac) for nid, hdr, cnt, ac in uncached
+            ]
+            results = extract_entities_and_relationships_batch(batch_input)
+
+            # Cache each result
+            for item, result in zip(uncached, results):
+                _save_cached_result(item[0], result)
+
+            return cached_results + results
+
+        # ── Batching: group small nodes (< 500 chars) into batches of up to 5 ──
+        BATCH_CONTENT_THRESHOLD = 500
+        BATCH_SIZE = 5
+
+        small_items = [
+            item for item in work_items
+            if len(item[2].strip()) < BATCH_CONTENT_THRESHOLD
+        ]
+        large_items = [
+            item for item in work_items
+            if len(item[2].strip()) >= BATCH_CONTENT_THRESHOLD
+        ]
+
+        # Create batches from small items
+        batches = [
+            small_items[i:i + BATCH_SIZE]
+            for i in range(0, len(small_items), BATCH_SIZE)
+        ]
+
+        if batches:
+            logger.info(
+                "batching_small_nodes",
+                small_nodes=len(small_items),
+                large_nodes=len(large_items),
+                batches=len(batches),
             )
 
         entity_count = 0
@@ -506,71 +741,88 @@ class RNSRClient:
             max_workers=max_workers,
         )
 
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_to_node = {
-                pool.submit(_extract_node, item): item[0]
-                for item in work_items
-            }
+        def _add_result_to_kg(result: RLMUnifiedResult):
+            """Add extraction result to the knowledge graph."""
+            nonlocal entity_count, relationship_count, nodes_done
+            nodes_done += 1
+            node_id = result.node_id
+            node_entities_added = 0
+            node_rels_added = 0
 
-            for future in as_completed(future_to_node):
-                node_id = future_to_node[future]
-                nodes_done += 1
+            for entity in result.entities:
                 try:
-                    result = future.result()
-                except Exception as exc:
+                    kg.add_entity(entity)
+                    entity_count += 1
+                    node_entities_added += 1
+                except Exception as ent_err:
                     logger.warning(
-                        "extraction_failed_for_node",
-                        node_id=node_id,
+                        "add_entity_failed",
+                        entity_id=getattr(entity, "id", "?"),
+                        entity_name=getattr(entity, "canonical_name", "?"),
+                        error=str(ent_err),
+                    )
+
+            for relationship in result.relationships:
+                try:
+                    kg.add_relationship(relationship)
+                    relationship_count += 1
+                    node_rels_added += 1
+                except Exception as rel_err:
+                    logger.warning(
+                        "add_relationship_failed",
+                        rel_id=getattr(relationship, "id", "?"),
+                        error=str(rel_err),
+                    )
+
+            entity_names = [e.canonical_name for e in result.entities]
+            skel_node = skeleton.get(node_id)
+            header_text = skel_node.header if skel_node else node_id
+            logger.info(
+                "node_extraction_complete",
+                progress=f"{nodes_done}/{total_nodes}",
+                node_id=node_id,
+                header=header_text[:60],
+                entities_added=node_entities_added,
+                relationships_added=node_rels_added,
+                entity_names=entity_names,
+                running_total_entities=entity_count,
+                running_total_relationships=relationship_count,
+            )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            # Submit large nodes individually
+            future_to_meta: dict = {}
+            for item in large_items:
+                fut = pool.submit(_extract_node, item)
+                future_to_meta[fut] = ("single", item[0])
+
+            # Submit batches of small nodes
+            for batch in batches:
+                fut = pool.submit(_extract_batch, batch)
+                batch_ids = [item[0] for item in batch]
+                future_to_meta[fut] = ("batch", batch_ids)
+
+            # Collect all results as they complete
+            for future in as_completed(future_to_meta):
+                kind, meta = future_to_meta[future]
+                try:
+                    if kind == "single":
+                        result = future.result()
+                        _add_result_to_kg(result)
+                    else:
+                        results = future.result()
+                        for result in results:
+                            _add_result_to_kg(result)
+                except Exception as exc:
+                    if kind == "single":
+                        nodes_done += 1
+                    logger.warning(
+                        "extraction_failed",
+                        kind=kind,
+                        meta=meta,
                         progress=f"{nodes_done}/{total_nodes}",
                         error=str(exc),
                     )
-                    continue
-
-                node_entities_added = 0
-                node_rels_added = 0
-
-                # Add entities (already proper Entity objects)
-                for entity in result.entities:
-                    try:
-                        kg.add_entity(entity)
-                        entity_count += 1
-                        node_entities_added += 1
-                    except Exception as ent_err:
-                        logger.warning(
-                            "add_entity_failed",
-                            entity_id=getattr(entity, "id", "?"),
-                            entity_name=getattr(entity, "canonical_name", "?"),
-                            error=str(ent_err),
-                        )
-
-                # Add relationships (already proper Relationship objects)
-                for relationship in result.relationships:
-                    try:
-                        kg.add_relationship(relationship)
-                        relationship_count += 1
-                        node_rels_added += 1
-                    except Exception as rel_err:
-                        logger.warning(
-                            "add_relationship_failed",
-                            rel_id=getattr(relationship, "id", "?"),
-                            error=str(rel_err),
-                        )
-
-                # Per-node summary with entity names for easy monitoring
-                entity_names = [e.canonical_name for e in result.entities]
-                header = skeleton.get(node_id)
-                header_text = header.header if header else node_id
-                logger.info(
-                    "node_extraction_complete",
-                    progress=f"{nodes_done}/{total_nodes}",
-                    node_id=node_id,
-                    header=header_text[:60],
-                    entities_added=node_entities_added,
-                    relationships_added=node_rels_added,
-                    entity_names=entity_names,
-                    running_total_entities=entity_count,
-                    running_total_relationships=relationship_count,
-                )
 
         logger.info(
             "knowledge_graph_created",

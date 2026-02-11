@@ -241,12 +241,20 @@ def chat(message: str, history: list, progress=gr.Progress()):
                             break
             if mentioned:
                 parts = []
-                for ent in mentioned[:3]:
+                for ent in mentioned[:5]:
+                    rels = state.knowledge_graph.get_entity_relationships(ent.id)
+                    rel_lines = []
+                    for rel in rels[:8]:
+                        rel_lines.append(
+                            f"  - {rel.type.value} → {rel.target_id}"
+                        )
                     co = state.knowledge_graph.get_entities_mentioned_together(ent.id)
-                    related = [e.canonical_name for e, _ in co[:3]]
+                    related = [e.canonical_name for e, _ in co[:5]]
                     line = f"- **{ent.canonical_name}** ({ent.type.value})"
                     if related:
                         line += f" — related to: {', '.join(related)}"
+                    if rel_lines:
+                        line += "\n" + "\n".join(rel_lines)
                     parts.append(line)
                 response += "\n\n*Entity context:*\n" + "\n".join(parts)
 
