@@ -712,9 +712,13 @@ def create_demo():
         footer { text-align: center; opacity: 0.7; font-size: 0.85rem; margin-top: 2rem; }
     """
     
-    with gr.Blocks(
-        title="RNSR - Document Q&A",
-    ) as demo:
+    # Gradio 6 moved theme/css to launch(); Gradio 4/5 takes them in the constructor
+    blocks_kwargs = {"title": "RNSR - Document Q&A"}
+    if _gradio_major < 6:
+        blocks_kwargs["theme"] = theme
+        blocks_kwargs["css"] = custom_css
+    
+    with gr.Blocks(**blocks_kwargs) as demo:
         print("Inside gr.Blocks context...", flush=True)
         
         # Header
@@ -810,14 +814,18 @@ Upload a PDF above and click **Process Document** to begin.
                 with gr.Tabs():
                     # Chat Tab
                     with gr.TabItem("💬 Chat"):
-                        chatbot = gr.Chatbot(
+                        chatbot_kwargs = dict(
                             label="Conversation",
                             height=350,
                             show_label=False,
                             placeholder="📄 Upload and process a document first, then ask questions here...",
                             avatar_images=(None, "https://api.dicebear.com/7.x/bottts/svg?seed=rnsr"),
-                            buttons=["copy"],
                         )
+                        if _gradio_major >= 6:
+                            chatbot_kwargs["buttons"] = ["copy"]
+                        else:
+                            chatbot_kwargs["show_copy_button"] = True
+                        chatbot = gr.Chatbot(**chatbot_kwargs)
                 
                 # Example questions as clickable buttons
                 gr.Markdown("**Try an example:**")
@@ -922,7 +930,10 @@ Upload a PDF above and click **Process Document** to begin.
             for status in process_document(file, extract_entities):
                 tables_list = get_tables_list()
                 dropdown_choices = get_table_dropdown_choices()
-                dropdown_update = gr.Dropdown(choices=dropdown_choices, value=dropdown_choices[0] if dropdown_choices else None)
+                if _gradio_major >= 6:
+                    dropdown_update = gr.Dropdown(choices=dropdown_choices, value=dropdown_choices[0] if dropdown_choices else None)
+                else:
+                    dropdown_update = gr.update(choices=dropdown_choices, value=dropdown_choices[0] if dropdown_choices else None)
                 yield status, get_tree_visualization(), tables_list, dropdown_update
         
         process_btn.click(
@@ -970,7 +981,10 @@ Upload a PDF above and click **Process Document** to begin.
         # Table query handlers
         def update_table_dropdown():
             choices = get_table_dropdown_choices()
-            return gr.Dropdown(choices=choices, value=choices[0] if choices else None)
+            if _gradio_major >= 6:
+                return gr.Dropdown(choices=choices, value=choices[0] if choices else None)
+            else:
+                return gr.update(choices=choices, value=choices[0] if choices else None)
         
         refresh_dropdown_btn.click(
             fn=update_table_dropdown,
@@ -1040,10 +1054,13 @@ if __name__ == "__main__":
     
     demo = create_demo()
     print("Launching demo server...", flush=True)
-    demo.launch(
+    launch_kwargs = dict(
         server_name="0.0.0.0",
         server_port=7860,
         share=False,  # Disabled to avoid slow share link creation
-        theme=demo._rnsr_theme,
-        css=demo._rnsr_css,
     )
+    # Gradio 6 accepts theme/css in launch(); older versions already got them in Blocks()
+    if _gradio_major >= 6:
+        launch_kwargs["theme"] = demo._rnsr_theme
+        launch_kwargs["css"] = demo._rnsr_css
+    demo.launch(**launch_kwargs)
