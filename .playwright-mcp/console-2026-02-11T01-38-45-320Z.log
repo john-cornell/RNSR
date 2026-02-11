@@ -1,0 +1,10 @@
+[   33340ms] [WARNING] Method not implemented. @ http://localhost:7860/assets/index-B5Zu_GVg.js:3
+[   33386ms] [WARNING] Method not implemented. @ http://localhost:7860/assets/index-B5Zu_GVg.js:3
+[  233102ms] [ERROR] TypeError: network error @ http://localhost:7860/assets/index-B5Zu_GVg.js:3
+[  233103ms] [ERROR] Unexpected error Connection errored out.  @ http://localhost:7860/assets/index-B5Zu_GVg.js:3
+[  259725ms] [WARNING] Attempted to select a non-interactive or hidden tab. @ http://localhost:7860/assets/Tabs-C0yBUI0Z.js:0
+[  259726ms] [WARNING] Attempted to select a non-interactive or hidden tab. @ http://localhost:7860/assets/Tabs-C0yBUI0Z.js:0
+[  259729ms] [WARNING] Attempted to select a non-interactive or hidden tab. @ http://localhost:7860/assets/Tabs-C0yBUI0Z.js:0
+[  259733ms] [WARNING] Attempted to select a non-interactive or hidden tab. @ http://localhost:7860/assets/Tabs-C0yBUI0Z.js:0
+[  259733ms] [WARNING] Attempted to select a non-interactive or hidden tab. @ http://localhost:7860/assets/Tabs-C0yBUI0Z.js:0
+[  259733ms] [WARNING] Attempted to select a non-interactive or hidden tab. @ http://localhost:7860/assets/Tabs-C0yBUI0Z.js:0
