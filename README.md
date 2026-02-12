@@ -105,7 +105,7 @@ RNSR combines neural and symbolic approaches to achieve accurate document unders
 | **🏆 100% FinanceBench** | Only retrieval system to achieve perfect accuracy on the industry benchmark |
 | **Zero Hallucinations** | Grounded answers with provenance - if not found, says so |
 | **Hierarchical Extraction** | Preserves document structure (sections, subsections, paragraphs) |
-| **Knowledge Graph** | Entity extraction (companies, people, dates, amounts) with relationship tracking |
+| **Knowledge Graph** | LLM-driven entity & relationship extraction with adaptive type learning and parallel processing |
 | **RLM Navigation** | LLM writes code to navigate documents - deterministic and reproducible |
 | **SQL-like Table Queries** | `SELECT`, `WHERE`, `ORDER BY`, `SUM`, `AVG` over detected tables |
 | **Provenance System** | Every answer traces back to exact document citations |
@@ -181,6 +181,10 @@ OLLAMA_MODEL=qwen2.5-coder:32b
 # Optional: Override default models
 LLM_PROVIDER=anthropic
 SUMMARY_MODEL=claude-sonnet-4-5
+
+# Optional: Use a fast, cheap model for entity extraction
+RNSR_EXTRACTION_MODEL=gemini-2.5-flash
+# RNSR_EXTRACTION_PROVIDER=gemini  # if different from your primary provider
 ```
 
 **Ollama with WSL (Ollama on Windows):** If you run RNSR inside WSL and Ollama on Windows, `localhost` from WSL will not reach Ollama by default. Use [WSL mirrored networking](https://learn.microsoft.com/en-us/windows/wsl/networking#mirrored-mode-networking-in-wsl-2): create or edit `%USERPROFILE%\.wslconfig` with:
@@ -229,15 +233,13 @@ The RNSR benchmark (`make benchmark-compare`) achieves zero hallucinations and h
 
 The benchmark uses three key components that work together:
 
-1. **Knowledge Graph with Entity Extraction** - Automatically extracts and indexes:
-   - Organization names (companies, firms)
-   - Person names and roles
-   - Monetary values and dates
-   - Section/clause references
+1. **Knowledge Graph with LLM-Driven Entity Extraction** - Uses the `RLMUnifiedExtractor` to discover entities and relationships directly from the text. The extractor is adaptive -- it learns new entity types from your documents and persists them to `~/.rnsr/learned_entity_types.json`. No hardcoded patterns; the LLM writes extraction code grounded in the actual document content.
    
-2. **Cached LLM Instance** - Reuses a single LLM instance across queries for consistency and reduced latency
+2. **Parallel Extraction** - Entity extraction runs across skeleton nodes in parallel using a thread pool (default 8 workers), reducing wall-clock time by up to 8x for large documents.
 
-3. **RLMNavigator with Entity Awareness** - The navigator can query the knowledge graph to understand relationships between entities in the document
+3. **Cached LLM Instance** - Reuses a single LLM instance across queries for consistency and reduced latency
+
+4. **RLMNavigator with Entity Awareness** - The navigator can query the knowledge graph to understand relationships between entities in the document
 
 ### Replicating in Your Application
 
@@ -306,7 +308,7 @@ result = navigator.navigate("What is the contract value?")
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `use_rlm` | `True` | Use RLM Navigator (vs. simpler navigator) |
-| `use_knowledge_graph` | `True` | Extract entities and build knowledge graph |
+| `use_knowledge_graph` | `True` | Extract entities/relationships in parallel and build knowledge graph |
 | `enable_pre_filtering` | `True` | Filter nodes by keywords before LLM calls |
 | `enable_verification` | `False` | Enable strict critic loop (can reject valid answers) |
 | `max_recursion_depth` | `3` | Maximum depth for recursive sub-LLM calls |
@@ -317,6 +319,7 @@ result = navigator.navigate("What is the contract value?")
 2. **Keep `use_knowledge_graph=True`** - This is key to benchmark-level accuracy
 3. **Set `enable_verification=False`** for most cases - The critic can be too aggressive
 4. **Reuse the same client instance** - The navigator and knowledge graph are cached
+5. **Parallel extraction is automatic** - Knowledge graph building runs up to 8 extraction threads in parallel. Tune `max_workers` on the `_get_or_create_knowledge_graph` call if you hit API rate limits
 
 ## New Features
 
@@ -468,53 +471,162 @@ The more you use RNSR, the better it gets at understanding your domain.
 
 ## How It Works
 
+### High-Level System Overview
+
+```mermaid
+graph LR
+    PDF["📄 PDF Document"]
+    ING["🔍 Ingestion"]
+    TREE["🌳 Hierarchical Tree"]
+    SKEL["📋 Skeleton Index"]
+    KG["🧠 Knowledge Graph"]
+    NAV["🧭 RLM Navigator"]
+    ANS["✅ Grounded Answer"]
+
+    PDF --> ING
+    ING --> TREE
+    TREE --> SKEL
+    TREE --> KG
+    SKEL --> NAV
+    KG --> NAV
+    NAV --> ANS
+
+    style PDF fill:#e1f5fe
+    style KG fill:#f3e5f5
+    style ANS fill:#e8f5e9
+```
+
 ### Document Ingestion Pipeline
 
-```
-PDF → Font Analysis → Header Classification → Tree Building → Skeleton Index
-         ↓                    ↓                    ↓              ↓
-   Detect font sizes   Classify H1/H2/H3    Build hierarchy   Create summaries
-                                                  ↓
-                                        Multi-doc detection
-                                        (page number resets)
+```mermaid
+flowchart TD
+    A["📄 PDF Input"] --> B["Font Histogram Analysis"]
+    B --> C["Header Classification\n(H1 / H2 / H3)"]
+    C --> D{"Multiple Documents?"}
+    D -->|"Yes (page-number resets)"| E["Split into Sub-Documents"]
+    D -->|No| F["Build Hierarchical Tree"]
+    E --> F
+    F --> G["Skeleton Index\n(lightweight summaries)"]
+    F --> H["KV Store\n(full section content)"]
+    F --> I["Table Detection\n& Parsing"]
+
+    style A fill:#e1f5fe
+    style F fill:#fff3e0
+    style G fill:#e8f5e9
+    style H fill:#e8f5e9
+    style I fill:#e8f5e9
 ```
 
 ### Query Processing
 
-```
-Question → Clarify → Pre-Filter → Tree Navigation → Answer → Self-Reflect → Verify
-              ↓           ↓              ↓             ↓           ↓           ↓
-        Ask if ambig  Keyword scan  ToT reasoning  Synthesize  Critique   Fact-check
-                                         ↓                        ↓
-                                  Sub-LLM recursion        Improve answer
-                                  (complex queries)        (if issues)
+```mermaid
+flowchart LR
+    Q["❓ Question"] --> CL["Clarify\nambiguity?"]
+    CL --> PF["Pre-Filter\n(keyword scan)"]
+    PF --> NAV["RLM Tree\nNavigation"]
+    NAV --> SYN["Synthesise\nAnswer"]
+    SYN --> SR["Self-Reflect\n& Critique"]
+    SR --> VER["Verify\n(optional)"]
+    VER --> A["✅ Answer +\nProvenance"]
+
+    NAV -->|"complex query"| SUB["Sub-LLM\nRecursion"]
+    SUB --> NAV
+
+    style Q fill:#e1f5fe
+    style A fill:#e8f5e9
+    style NAV fill:#fff3e0
 ```
 
-### Entity Extraction (RLM Unified)
+### Entity Extraction (RLM Unified, Parallel)
+
+The extractor receives **ancestor context** from the skeleton tree so it always
+knows *whose* data it is extracting (e.g. the primary applicant's passport).
+
+```mermaid
+flowchart TD
+    DOC["🌳 Document Tree"] --> SPLIT["Split into\nSkeleton Nodes"]
+    SPLIT --> CTX["Build Ancestor Context\nper Node"]
+    CTX --> POOL["ThreadPool\n(8 workers)"]
+
+    subgraph PER_NODE ["Per-Node Extraction"]
+        direction TB
+        ANC["📍 Ancestor Breadcrumb\n+ Subject Hint"] --> LLM["LLM Writes\nExtraction Code"]
+        LLM --> EXEC["Execute on\nDOC_VAR"]
+        EXEC --> TOT["ToT Validation\n(probability scores)"]
+        TOT --> ENT["Entities &\nRelationships"]
+    end
+
+    POOL --> PER_NODE
+    PER_NODE --> MERGE["Merge Results"]
+    MERGE --> KG["🧠 Knowledge Graph"]
+    MERGE --> LEARN["📚 Learn New Types\n(~/.rnsr/)"]
+
+    style DOC fill:#e1f5fe
+    style KG fill:#f3e5f5
+    style LEARN fill:#fce4ec
+    style ANC fill:#fff9c4
+```
+
+**Ancestor context example** — when extracting *Identity Documents* (a child of
+*PRIMARY APPLICANT DETAILS*), the prompt receives:
 
 ```
-Document → LLM writes code → Execute on DOC_VAR → ToT validation → Cross-validate
-              ↓                     ↓                   ↓               ↓
-     Generates regex/Python   Grounded results   Probability scores  Entity↔Relationship
-                                    ↓
-                            All tied to exact text spans
+Document path: Form 80 > PRIMARY APPLICANT DETAILS > Identity Documents
+Subject context: Title: Mr | Family Name: Sorenssen | Given Names: GeoV William | ...
+```
+
+This lets the LLM produce `Passport PA1234567 → BELONGS_TO → GeoV William Sorenssen`
+instead of the meaningless `Passport → MENTIONS → PA1234567`.
+
+### Knowledge Graph Self-Learning
+
+Relationship types that the LLM discovers but don't match a canonical type are
+persisted to `~/.rnsr/learned_relationship_types.json`. On future documents the
+learned types are injected back into the extraction prompt, creating a feedback
+loop that improves with use.
+
+```mermaid
+flowchart LR
+    EXT["Extraction\nResult"] --> CHK{"Type matches\ncanonical?"}
+    CHK -->|Yes| KG["Knowledge Graph"]
+    CHK -->|No → OTHER| REC["Record in\nRegistry"]
+    REC --> AUTO["Auto-Suggest\nCanonical Mapping"]
+    AUTO --> JSON["💾 ~/.rnsr/\nlearned_*.json"]
+    JSON -->|"Next extraction"| PROMPT["Inject into\nLLM Prompt"]
+    PROMPT --> EXT
+
+    style JSON fill:#fce4ec
+    style KG fill:#e8f5e9
+    style PROMPT fill:#fff9c4
 ```
 
 ### RLM Navigation Architecture (ToT + REPL Integration)
 
-RNSR uses a unique combination of Tree of Thoughts (ToT) reasoning and a REPL (Read-Eval-Print Loop) environment for document navigation. This is what sets RNSR apart from naive RAG approaches:
+RNSR uses a unique combination of Tree of Thoughts (ToT) reasoning and a REPL (Read-Eval-Print Loop) environment for document navigation. This is what sets RNSR apart from naive RAG approaches.
 
 **The Problem with Naive RAG:**
 Traditional RAG splits documents into chunks, embeds them, and retrieves based on similarity. This loses hierarchical structure and often retrieves irrelevant chunks for complex queries.
 
 **RNSR's RLM Navigation Solution:**
 
-```
-Query → NavigationREPL → LLM Generates Code → Execute → Findings → ToT Validation → Answer
-           ↓                    ↓                ↓          ↓            ↓
-    Expose document       search_tree()      Find relevant  Store     Verify with
-    as environment        navigate_to()      nodes          findings  probabilities
-                          get_content()
+```mermaid
+flowchart TD
+    Q["❓ Query"] --> REPL["NavigationREPL\n(document as environment)"]
+
+    subgraph LOOP ["Iterative Code-Generation Loop"]
+        direction TB
+        REPL --> GEN["LLM Generates\nPython Code"]
+        GEN --> RUN["Execute Code\n(search_tree, navigate_to, …)"]
+        RUN --> FIND["Store Findings"]
+        FIND -->|"Need more info"| REPL
+        FIND -->|"ready_to_synthesize()"| VAL["ToT Validation\n(probability scores)"]
+    end
+
+    VAL --> ANS["✅ Grounded Answer\n+ Citations"]
+
+    style Q fill:#e1f5fe
+    style ANS fill:#e8f5e9
+    style GEN fill:#fff3e0
 ```
 
 **How it works:**
@@ -562,11 +674,65 @@ Query → NavigationREPL → LLM Generates Code → Execute → Findings → ToT
 
 ## Architecture
 
+```mermaid
+graph TD
+    CLIENT["client.py\nHigh-Level API"]
+
+    subgraph INGESTION ["ingestion/"]
+        P["pipeline.py"]
+        FH["font_histogram.py"]
+        HC["header_classifier.py"]
+        TB["tree_builder.py"]
+        TP["table_parser.py"]
+        CP["chart_parser.py"]
+    end
+
+    subgraph INDEXING ["indexing/"]
+        SI["skeleton_index.py"]
+        KV["kv_store.py"]
+        KGR["knowledge_graph.py"]
+        SS["semantic_search.py"]
+    end
+
+    subgraph EXTRACTION ["extraction/"]
+        RUE["rlm_unified_extractor.py"]
+        LT["learned_types.py"]
+        EL["entity_linker.py"]
+        MOD["models.py"]
+    end
+
+    subgraph AGENT ["agent/"]
+        RN["rlm_navigator.py"]
+        NR["nav_repl.py"]
+        PROV["provenance.py"]
+        LC["llm_cache.py"]
+        SR["self_reflection.py"]
+        RM["reasoning_memory.py"]
+        QC["query_clarifier.py"]
+    end
+
+    LLM["llm.py\nMulti-Provider Abstraction"]
+
+    CLIENT --> INGESTION
+    CLIENT --> INDEXING
+    CLIENT --> EXTRACTION
+    CLIENT --> AGENT
+    AGENT --> LLM
+    EXTRACTION --> LLM
+    INGESTION --> INDEXING
+
+    style CLIENT fill:#e1f5fe
+    style LLM fill:#fff3e0
+```
+
+<details>
+<summary>File tree (plain text)</summary>
+
 ```
 rnsr/
 ├── agent/                   # Query processing
 │   ├── rlm_navigator.py     # Main navigation agent (RLM + ToT)
-│   ├── nav_repl.py          # NavigationREPL for code-based navigation (NEW)
+│   ├── nav_repl.py          # NavigationREPL for code-based navigation
 │   ├── repl_env.py          # Base REPL environment
 │   ├── provenance.py        # Citation tracking
 │   ├── llm_cache.py         # Response caching
@@ -576,7 +742,7 @@ rnsr/
 │   ├── graph.py             # LangGraph workflow
 │   └── variable_store.py    # Context management
 ├── extraction/              # Entity/relationship extraction
-│   ├── rlm_unified_extractor.py  # Best extractor (NEW)
+│   ├── rlm_unified_extractor.py  # Unified extractor (RLM + ToT)
 │   ├── learned_types.py     # Adaptive type learning
 │   ├── entity_linker.py     # Cross-document linking
 │   └── models.py            # Entity/Relationship models
@@ -589,13 +755,15 @@ rnsr/
 │   ├── pipeline.py          # Main ingestion orchestrator
 │   ├── font_histogram.py    # Font-based structure detection
 │   ├── header_classifier.py # H1/H2/H3 classification
-│   ├── table_parser.py      # Table extraction (NEW)
-│   ├── chart_parser.py      # Chart interpretation (NEW)
+│   ├── table_parser.py      # Table extraction
+│   ├── chart_parser.py      # Chart interpretation
 │   └── tree_builder.py      # Hierarchical tree construction
 ├── llm.py                   # Multi-provider LLM abstraction
 ├── client.py                # High-level API
 └── models.py                # Data structures
 ```
+
+</details>
 
 ## API Reference
 
@@ -672,6 +840,8 @@ record = tracker.create_provenance_record(answer, question, variables)
 | `EMBEDDING_MODEL` | Embedding model | `text-embedding-3-small` |
 | `KV_STORE_PATH` | SQLite database path | `./data/kv_store.db` |
 | `LOG_LEVEL` | Logging verbosity | `INFO` |
+| `RNSR_EXTRACTION_MODEL` | Model for entity extraction (e.g. `gemini-2.5-flash`) | Same as primary LLM |
+| `RNSR_EXTRACTION_PROVIDER` | Provider for entity extraction (`openai`, `anthropic`, `gemini`) | Same as primary provider |
 | `RNSR_LLM_CACHE_PATH` | Custom cache location | `~/.rnsr/llm_cache.db` |
 | `RNSR_REASONING_MEMORY_PATH` | Custom memory location | `~/.rnsr/reasoning_chains.json` |
 

@@ -1364,7 +1364,9 @@ class RLMNavigator:
         self.pre_filter = PreFilterEngine(self.config)
         self.recursive_engine = RecursiveSubLLMEngine(self.config)
         self.verification_engine = AnswerVerificationEngine(self.config)
-        self.entity_decomposer = EntityAwareDecomposer(knowledge_graph)
+        self.entity_decomposer = EntityAwareDecomposer(
+            knowledge_graph, skeleton=skeleton, kv_store=kv_store,
+        )
         
         # NavigationREPL for RLM-style code generation navigation
         self.nav_repl = create_navigation_repl(skeleton, kv_store, tables=tables)
@@ -1858,6 +1860,9 @@ Generate 2-3 SIMPLE patterns, one per line:"""
                     # Clean up the pattern
                     if line.startswith('```'):
                         continue
+                    # Remove list markers like "- ", "* ", "1. "
+                    line = re.sub(r'^[-*]\s+', '', line)
+                    line = re.sub(r'^\d+\.\s+', '', line)
                     # Remove quotes if present
                     line = line.strip('"\'`')
                     if line:
@@ -2012,6 +2017,51 @@ Generate 2-3 SIMPLE patterns, one per line:"""
             
             # Get full content directly from kv_store (no LLM involved)
             content = self.nav_repl.kv_store.get(node_id) or ""
+            
+            # Check if this is a parent/container node with children but little
+            # direct content.  When the user asks about "primary applicant" and
+            # we match the header "PRIMARY APPLICANT DETAILS" which is a parent
+            # section, we need to expand into its children (Personal Information,
+            # Contact Details, etc.) where the actual data lives.
+            node_obj = self.skeleton.get(node_id)
+            if node_obj and node_obj.child_ids and len(content) < 200:
+                logger.info(
+                    "expanding_parent_into_children",
+                    parent=header,
+                    num_children=len(node_obj.child_ids),
+                )
+                for child_id in node_obj.child_ids:
+                    child_node = self.skeleton.get(child_id)
+                    if not child_node:
+                        continue
+                    child_content = self.nav_repl.kv_store.get(child_id) or ""
+                    if not child_content or len(child_content) < 20:
+                        continue
+                    child_pointer = generate_pointer_name(child_node.header)
+                    
+                    self.variable_store.assign(child_pointer, child_content, child_id)
+                    if child_id not in state.visited_nodes:
+                        state.visited_nodes.append(child_id)
+                    if child_pointer not in state.variables:
+                        state.variables.append(child_pointer)
+                        state.context += f"\n{child_pointer}: {child_content[:500]}"
+                    
+                    findings_stored += 1
+                    logger.info(
+                        "child_finding_stored",
+                        pointer=child_pointer,
+                        node_id=child_id,
+                        header=child_node.header,
+                        parent=header,
+                        content_length=len(child_content),
+                    )
+                    if findings_stored >= max_findings:
+                        break
+                
+                state.visited_nodes.append(node_id)
+                if findings_stored >= max_findings:
+                    break
+                continue
             
             # For sibling sections, use lower content threshold (they provide context)
             min_length = 20 if is_sibling else self.config.rlm_min_content_length
@@ -2531,12 +2581,20 @@ JSON only:"""
             state.confidence = 0.0
             return state
         
-        # Collect all variable content
+        # Collect all variable content, labelling each with its real
+        # section header so the LLM can cite by section name.
         contents = []
         for pointer in state.variables:
             content = self.variable_store.resolve(pointer)
             if content:
-                contents.append(f"=== {pointer} ===\n{content}")
+                # Resolve the original section header from the skeleton
+                section_label = pointer
+                stored = self.variable_store.metadata.get(pointer)
+                if stored:
+                    node = self.skeleton.get(stored.source_node_id)
+                    if node:
+                        section_label = f"Section: {node.header}"
+                contents.append(f"=== {section_label} ===\n{content}")
         
         context_text = "\n\n".join(contents)
         
@@ -2561,6 +2619,29 @@ Context:
 
 Respond with ONLY the letter and full option text (e.g., "A. [option text]"):"""
         else:
+            # Build entity context from KG if available
+            entity_context_text = ""
+            if self.knowledge_graph and state.metadata.get("entities_found"):
+                entity_lines = []
+                for entity in state.metadata["entities_found"][:5]:
+                    rels = self.knowledge_graph.get_entity_relationships(entity.id)
+                    if rels:
+                        for rel in rels[:10]:
+                            entity_lines.append(
+                                f"- {rel.source_id} → {rel.type.value} → {rel.target_id}"
+                            )
+                    co = self.knowledge_graph.get_entities_mentioned_together(entity.id)
+                    if co:
+                        related = [e.canonical_name for e, _ in co[:5]]
+                        entity_lines.append(
+                            f"- {entity.canonical_name} is related to: {', '.join(related)}"
+                        )
+                if entity_lines:
+                    entity_context_text = (
+                        "\n\nKnowledge Graph Context (entity relationships from this document):\n"
+                        + "\n".join(entity_lines)
+                    )
+
             synthesis_prompt = f"""You have access to the following document sections. Answer the question using ONLY these sections.
 
 STRICT GROUNDING RULES:
@@ -2570,11 +2651,14 @@ STRICT GROUNDING RULES:
 4. Do NOT use any knowledge outside these sections
 5. Do NOT paraphrase or infer beyond what is explicitly stated
 6. Be comprehensive - use all relevant information from the sections
+7. When asked "who is X" — look for names, dates of birth, nationalities, and other identifying information in the sections
+8. When referencing where information comes from, cite the section name shown in the === Section: ... === headers above (e.g. "According to the 'Liability Clause' section...")
+9. Do NOT invent paragraph numbers, page numbers, or citation markers (like P11, P48, [1]) that are not explicitly in the source text
 
 Question: {state.question}
 
 Document Sections:
-{context_text}
+{context_text}{entity_context_text}
 
 Answer (grounded in document sections):"""
         
@@ -2857,6 +2941,8 @@ class EntityAwareDecomposer:
         self,
         knowledge_graph=None,
         llm_fn: Callable[[str], str] | None = None,
+        skeleton: dict | None = None,
+        kv_store=None,
     ):
         """
         Initialize the entity-aware decomposer.
@@ -2864,9 +2950,13 @@ class EntityAwareDecomposer:
         Args:
             knowledge_graph: Optional knowledge graph for entity lookup.
             llm_fn: LLM function for query analysis.
+            skeleton: Skeleton index for section header search.
+            kv_store: KV store for reading section content.
         """
         self.kg = knowledge_graph
         self._llm_fn = llm_fn
+        self._skeleton = skeleton
+        self._kv_store = kv_store
     
     def set_llm_function(self, llm_fn: Callable[[str], str]) -> None:
         """Set the LLM function."""
@@ -2883,6 +2973,13 @@ class EntityAwareDecomposer:
     ) -> dict[str, Any]:
         """
         Decompose a query using entity awareness.
+        
+        When the query references a term like "primary applicant", the method:
+        1. Looks up KG entities matching the name
+        2. Also searches skeleton headers for matching sections
+        3. Includes child nodes of matching sections so the navigator
+           can reach leaf content (e.g. Personal Information under
+           PRIMARY APPLICANT DETAILS)
         
         Args:
             query: The user's query.
@@ -2925,10 +3022,35 @@ class EntityAwareDecomposer:
                     # Get nodes where this entity is mentioned
                     entity_nodes[entity.id] = list(entity.node_ids)
         
+        # Step 2b: Also search skeleton headers for matching terms.
+        # This catches cases like "primary applicant" → section header
+        # "PRIMARY APPLICANT DETAILS" which contains children with the
+        # actual details.
+        if hasattr(self, "_skeleton") and self._skeleton:
+            q_lower = query.lower()
+            for node_id, node in self._skeleton.items():
+                header_lower = node.header.lower()
+                # Check if any extracted entity name appears in the header
+                for name in entity_names:
+                    if name.lower() in header_lower:
+                        # Add this node and all its children to the retrieval plan
+                        if node.child_ids:
+                            for child_id in node.child_ids:
+                                result["retrieval_plan"].append({
+                                    "node_id": child_id,
+                                    "reason": f"child of section '{node.header}' matching '{name}'",
+                                })
+                        else:
+                            result["retrieval_plan"].append({
+                                "node_id": node_id,
+                                "reason": f"section header matches '{name}'",
+                            })
+                        break
+        
         result["entities_found"] = entities_found
         result["entity_nodes"] = entity_nodes
         
-        if not entities_found:
+        if not entities_found and not result["retrieval_plan"]:
             return result
         
         # Step 3: Get related entities and relationships

@@ -58,11 +58,16 @@ class KnowledgeGraph:
         Initialize the knowledge graph.
         
         Args:
-            db_path: Path to the SQLite database file.
+            db_path: Path to the SQLite database file, or ``:memory:`` for
+                     an in-memory graph.
                      Will be created if it doesn't exist.
         """
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._is_memory = str(db_path) == ":memory:"
+        self.db_path = Path(db_path) if not self._is_memory else db_path  # type: ignore[assignment]
+        self._persistent_conn: sqlite3.Connection | None = None
+
+        if not self._is_memory:
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         
         self._init_db()
         
@@ -171,15 +176,26 @@ class KnowledgeGraph:
     
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        """Context manager for database connections."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        # Enable foreign keys
-        conn.execute("PRAGMA foreign_keys = ON")
-        try:
-            yield conn
-        finally:
-            conn.close()
+        """Context manager for database connections.
+
+        For ``:memory:`` databases a single persistent connection is reused
+        so that the schema and data survive across calls.  For file-backed
+        databases a fresh connection is opened (and closed) each time.
+        """
+        if self._is_memory:
+            if self._persistent_conn is None:
+                self._persistent_conn = sqlite3.connect(":memory:", check_same_thread=False)
+                self._persistent_conn.row_factory = sqlite3.Row
+                self._persistent_conn.execute("PRAGMA foreign_keys = ON")
+            yield self._persistent_conn
+        else:
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            try:
+                yield conn
+            finally:
+                conn.close()
     
     # =========================================================================
     # Entity Operations
