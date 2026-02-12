@@ -1027,10 +1027,13 @@ Upload a PDF above and click **Process Document** to begin.
 
 
 if __name__ == "__main__":
-    # Check for API key
-    if not os.getenv("GOOGLE_API_KEY") and not os.getenv("OPENAI_API_KEY") and not os.getenv("ANTHROPIC_API_KEY"):
-        print("⚠️  Warning: No API key found. Set GOOGLE_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY")
-        print("   Example: export ANTHROPIC_API_KEY='your-key-here'")
+    # Check for API key (skip warning if Ollama is configured)
+    has_cloud_key = os.getenv("GOOGLE_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+    has_ollama = os.getenv("OLLAMA_BASE_URL") or os.getenv("USE_OLLAMA") or os.getenv("LLM_PROVIDER", "").lower() == "ollama"
+    if not has_cloud_key and not has_ollama:
+        print("⚠️  Warning: No LLM provider configured.")
+        print("   Set a cloud API key (GOOGLE_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY)")
+        print("   or configure Ollama (OLLAMA_BASE_URL or LLM_PROVIDER=ollama)")
         print()
     
     print("🚀 Starting RNSR Demo...")
